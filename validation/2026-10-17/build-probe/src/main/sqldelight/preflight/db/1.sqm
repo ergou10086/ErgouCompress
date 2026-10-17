@@ -1,0 +1,1 @@
+ALTER TABLE job_item ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0;
