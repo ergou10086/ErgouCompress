@@ -8,6 +8,7 @@ enum class Backend { X264, NVENC }
 enum class Speed { FAST, BALANCED }
 @Serializable
 enum class Container(val extension: String, val muxer: String) { MP4("mp4", "mp4"), MKV("mkv", "matroska") }
+@Serializable enum class OutputMode { COPY, REPLACE, CHANGE_EXTENSION }
 
 @Serializable
 data class EncodeSettings(
@@ -46,7 +47,12 @@ data class ResolvedPlan(
     val settings: EncodeSettings,
     val container: Container,
     val destination: LocalPath,
-)
+    val outputMode: OutputMode = OutputMode.COPY,
+    val onlyIfSmaller: Boolean = true,
+    val preserveSourceTime: Boolean = true,
+) {
+    init { require(outputMode == OutputMode.COPY || plannerVersion >= 2) { "原地计划需要 plannerVersion >= 2" } }
+}
 
 @Serializable
 data class FrozenJob(val schemaVersion: Int = 1, val id: String, val plans: List<ResolvedPlan>, val planHash: String)
@@ -63,7 +69,7 @@ data class ValidationReceipt(
 )
 
 @Serializable
-enum class AttemptStage { PREPARING, ENCODING, VALIDATING, PUBLISHING, SUCCEEDED, INTERRUPTED, FAILED }
+enum class AttemptStage { PREPARING, ENCODING, VALIDATING, PUBLISHING, SUCCEEDED, INTERRUPTED, FAILED, SKIPPED }
 
 @Serializable
 data class Progress(val outTimeUs: Long?, val totalBytes: Long?, val speed: Double?, val ended: Boolean) {

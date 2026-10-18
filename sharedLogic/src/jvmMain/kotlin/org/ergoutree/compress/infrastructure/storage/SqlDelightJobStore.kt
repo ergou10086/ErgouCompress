@@ -7,20 +7,24 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.encodeToString
 import org.ergoutree.compress.application.SnapshotJson
+import org.ergoutree.compress.application.PlanEncoding
 import org.ergoutree.compress.catalog.*
 import org.ergoutree.compress.domain.*
+import org.ergoutree.compress.domain.Workspace
 import org.ergoutree.compress.ports.JobStore
+import org.ergoutree.compress.ports.CommitStore
 import java.nio.file.Files
 import java.nio.file.Path
 import java.security.MessageDigest
 import java.util.Properties
 
 /** One serialized writer, short SQL transactions, no media I/O inside a transaction. */
-class SqlDelightJobStore(path: Path) : JobStore, AutoCloseable {
+class SqlDelightJobStore(path: Path) : JobStore, CommitStore, AutoCloseable {
     private val gate = Mutex()
     private val driver: JdbcSqliteDriver
     private val database: CatalogDatabase
     private val q get() = database.catalogQueries
+    private val commits get() = database.commitLogQueries
     init {
         Files.createDirectories(path.toAbsolutePath().parent)
         driver = JdbcSqliteDriver("jdbc:sqlite:${path.toAbsolutePath()}", Properties().apply {
@@ -34,8 +38,14 @@ class SqlDelightJobStore(path: Path) : JobStore, AutoCloseable {
                 CatalogDatabase.Schema.create(driver)
                 driver.execute(null, "PRAGMA user_version=${CatalogDatabase.Schema.version}", 0)
             } else if (version < CatalogDatabase.Schema.version) {
-                CatalogDatabase.Schema.migrate(driver, version, CatalogDatabase.Schema.version)
-                driver.execute(null, "PRAGMA user_version=${CatalogDatabase.Schema.version}", 0)
+                val backupRoot = Files.createDirectories(path.toAbsolutePath().parent.resolve("catalog-backups"))
+                val backup = backupRoot.resolve("v$version-${java.util.UUID.randomUUID()}.sqlite")
+                driver.execute(null, "VACUUM INTO ?", 1) { bindString(0, backup.toString()) }
+                java.nio.channels.FileChannel.open(backup, java.nio.file.StandardOpenOption.WRITE).use { it.force(true) }
+                CatalogDatabase(driver).transaction {
+                    CatalogDatabase.Schema.migrate(driver, version, CatalogDatabase.Schema.version)
+                    driver.execute(null, "PRAGMA user_version=${CatalogDatabase.Schema.version}", 0)
+                }
             } else require(version == CatalogDatabase.Schema.version) { "数据库版本 $version 高于当前程序；禁止降级打开" }
             database = CatalogDatabase(driver)
         } catch (failure: Throwable) { driver.close(); throw failure }
@@ -72,16 +82,16 @@ class SqlDelightJobStore(path: Path) : JobStore, AutoCloseable {
     }
     override suspend fun enqueue(job: FrozenJob, now: Long) = write {
         require(job.schemaVersion == 1 && job.plans.isNotEmpty())
-        val canonical = SnapshotJson.encodeToString(job.plans)
+        val canonical = PlanEncoding.canonicalList(job.plans)
         val hash = MessageDigest.getInstance("SHA-256").digest(canonical.toByteArray()).joinToString("") { "%02x".format(it) }
         require(hash == job.planHash) { "冻结任务 hash 不符" }
         q.findJob(job.id).executeAsOneOrNull()?.let {
-            require(it.snapshot == SnapshotJson.encodeToString(job)) { "任务 ID 已用于其他快照" }
+            require(SnapshotJson.decodeFromString<FrozenJob>(it.snapshot) == job) { "任务 ID 已用于其他快照" }
             return@write
         }
         q.insertJob(job.id, SnapshotJson.encodeToString(job), JobState.READY.name, now)
         job.plans.forEachIndexed { index, plan ->
-            require(plan.schemaVersion == 1 && plan.plannerVersion == 1) { "不支持的计划版本" }
+            require(plan.schemaVersion in 1..2 && plan.plannerVersion in 1..2) { "不支持的计划版本" }
             val itemId = "${job.id}:$index"
             q.insertItem(itemId, job.id, index.toLong(), SnapshotJson.encodeToString(plan), ItemState.READY.name)
             val target = Path.of(plan.destination.value).toAbsolutePath().normalize().toString().lowercase()
@@ -123,6 +133,9 @@ class SqlDelightJobStore(path: Path) : JobStore, AutoCloseable {
         aggregate(jobId, now)
     }
     override suspend fun cancel(jobId: String, now: Long) = write {
+        val state = jobRow(jobId).state
+        if (state in listOf("COMPLETED", "COMPLETED_WITH_ERRORS", "CANCELLED")) return@write
+        require(state != "NEEDS_ATTENTION") { "待对账任务不能取消并丢弃恢复状态" }
         q.updateJob("CANCELLED", jobId)
         q.listItems(jobId).executeAsList().forEach { item ->
             if (item.state == "RUNNING") {
@@ -173,16 +186,23 @@ class SqlDelightJobStore(path: Path) : JobStore, AutoCloseable {
             result.stage == AttemptStage.SUCCEEDED -> {
                 require(attempt.validation != null && attempt.output != null && attempt.state == "PUBLISHED") { "没有权威验证和发布证据，不能完成" }; ItemState.SUCCEEDED
             }
+            result.stage == AttemptStage.SKIPPED -> ItemState.SKIPPED
             attempt.state in listOf("PUBLISHING", "PUBLISHED") -> ItemState.NEEDS_ATTENTION
             jobRow(claim.item.jobId).state == "CANCELLED" -> ItemState.CANCELLED
             attempt.stop_requested != 0L || result.stage == AttemptStage.INTERRUPTED -> ItemState.INTERRUPTED
             else -> ItemState.FAILED
         }
         q.endAttempt(state.name, now, result.message, claim.attemptId); q.setItemState(state.name, claim.item.id)
-        if (state in listOf(ItemState.SUCCEEDED, ItemState.CANCELLED)) q.releaseTarget(claim.item.id)
+        if (state in listOf(ItemState.SUCCEEDED, ItemState.CANCELLED, ItemState.SKIPPED)) q.releaseTarget(claim.item.id)
         event(claim.item.jobId, claim.item.id, state.name, result.message, now); aggregate(claim.item.jobId, now)
     }
-    override suspend fun recoveryItems() = read { q.allItems().executeAsList().map { RecoveryItem(it.record(), q.latestAttempt(it.id).executeAsOneOrNull()?.record()) } }
+    override suspend fun recoveryItems() = read {
+        val journaled = commits.listCommits().executeAsList().mapNotNull { it.attempt_id }.toSet()
+        q.allItems().executeAsList().map {
+            val attempt = q.latestAttempt(it.id).executeAsOneOrNull()?.record()
+            RecoveryItem(it.record(), attempt, it.superseded != 0L, attempt?.id in journaled)
+        }
+    }
     override suspend fun recovered(itemId: String, state: ItemState, output: ContentEvidence?, diagnostic: String, now: Long) = write {
         val item = itemRow(itemId)
         if (item.active_attempt != null) {
@@ -195,4 +215,44 @@ class SqlDelightJobStore(path: Path) : JobStore, AutoCloseable {
         event(item.job_id, itemId, "Recovered", diagnostic, now); aggregate(item.job_id, now)
     }
     override fun close() = driver.close()
+
+    override suspend fun createCommit(record: CommitRecord, claim: ClaimedItem?, now: Long) = write {
+        if (record.restoreOf == null) {
+            val lease = requireNotNull(claim); checked(lease)
+            val attempt = q.findAttempt(lease.attemptId).executeAsOne()
+            require(attempt.stop_requested == 0L && attempt.state in listOf("VALIDATED", "PUBLISHING"))
+            require(record.attemptId == lease.attemptId && record.itemId == lease.item.id)
+            require(record.receipt == attempt.validation?.let { SnapshotJson.decodeFromString<ValidationReceipt>(it) }) { "没有本次执行的权威媒体验证" }
+        } else {
+            val parent = SnapshotJson.decodeFromString<CommitRecord>(commits.findCommit(record.restoreOf).executeAsOne().payload)
+            require(parent.phase == CommitPhase.COMMITTED && itemRow(parent.itemId).state == "SUCCEEDED") { "仅完成且未在执行的版本可恢复" }
+            require(record.source == parent.output && record.candidate.sha256 == parent.source.sha256 && record.plan.destination == parent.plan.destination)
+            val target = Path.of(record.plan.destination.value).toAbsolutePath().normalize().toString().lowercase()
+            require(q.findReservation(target).executeAsOneOrNull() == null) { "目标正由其他任务预留" }
+            q.reserveTarget(target, record.itemId)
+        }
+        commits.insertCommit(record.id, record.itemId, record.attemptId, record.restoreOf, record.phase.name, SnapshotJson.encodeToString(record))
+        event(itemRow(record.itemId).job_id, record.itemId, "CommitPrepared", record.id, now)
+    }
+    override suspend fun saveCommit(record: CommitRecord, now: Long): CommitRecord = write {
+        val updated = record.copy(revision = record.revision + 1)
+        check(commits.updateCommit(updated.phase.name, SnapshotJson.encodeToString(updated), record.id, record.revision).value == 1L) { "提交 revision 过期" }
+        if (updated.phase == CommitPhase.COMMITTED && updated.restoreOf != null) { q.markSuperseded(updated.itemId); q.releaseTarget(updated.itemId) }
+        event(itemRow(updated.itemId).job_id, updated.itemId, "Commit${updated.phase}", updated.id, now)
+        updated
+    }
+    override suspend fun commits() = read { commits.listCommits().executeAsList().map { SnapshotJson.decodeFromString<CommitRecord>(it.payload) } }
+    override suspend fun commit(id: String) = read { SnapshotJson.decodeFromString<CommitRecord>(commits.findCommit(id).executeAsOne().payload) }
+    override suspend fun registerWorkspace(workspace: Workspace) = write {
+        val existing = commits.listWorkspaces().executeAsList().firstOrNull { it.volume_id == workspace.volumeId }
+        require(existing == null || (existing.id == workspace.id && existing.root == workspace.root.value)) { "该卷已登记其他工作区" }
+        if (existing == null) commits.insertWorkspace(workspace.id, workspace.volumeId, workspace.root.value)
+        Unit
+    }
+    override suspend fun workspaces() = read { commits.listWorkspaces().executeAsList().map { Workspace(it.id, LocalPath(it.root), it.volume_id) } }
+    override suspend fun canResumeCommit(record: CommitRecord) = read {
+        record.attemptId == null || q.findAttempt(record.attemptId).executeAsOne().let {
+            it.stop_requested == 0L && (jobRow(itemRow(record.itemId).job_id).state != "CANCELLED" || it.state in listOf("PUBLISHING", "PUBLISHED", "SUCCEEDED"))
+        }
+    }
 }

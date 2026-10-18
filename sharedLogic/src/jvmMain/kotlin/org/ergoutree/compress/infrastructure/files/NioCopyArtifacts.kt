@@ -4,6 +4,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.encodeToString
 import org.ergoutree.compress.application.SnapshotJson
+import org.ergoutree.compress.application.PlanEncoding
 import org.ergoutree.compress.domain.*
 import org.ergoutree.compress.ports.*
 import java.nio.channels.FileChannel
@@ -36,7 +37,8 @@ class NioCopyArtifacts(private val archive: LocalPath, private val files: PlanEn
 
     override suspend fun preparePublication(plan: ResolvedPlan, receipt: ValidationReceipt, work: AttemptWorkspace, stop: StopSignal): PreparedCopy = withContext(Dispatchers.IO) {
         stop.checkRunning()
-        if (!receipt.fullDecodePassed || receipt.planHash != files.sha256(SnapshotJson.encodeToString(plan)) || receipt.candidate.identity.path != work.candidate)
+        require(plan.outputMode == OutputMode.COPY) { "副本适配器不提供原地覆盖" }
+        if (!receipt.fullDecodePassed || receipt.planHash != files.sha256(PlanEncoding.canonical(plan)) || receipt.candidate.identity.path != work.candidate)
             throw CompressException(ErrorCode.VALIDATION_FAILED, "校验凭据与计划/候选不匹配")
         if (files.evidence(plan.source.path) != receipt.source) throw CompressException(ErrorCode.INPUT_CHANGED, "发布前源文件已变化")
         if (files.evidence(work.candidate) != receipt.candidate) throw CompressException(ErrorCode.VALIDATION_FAILED, "发布前候选已变化")

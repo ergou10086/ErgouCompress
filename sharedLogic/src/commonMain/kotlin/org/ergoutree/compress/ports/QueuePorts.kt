@@ -26,11 +26,13 @@ interface JobStore {
     suspend fun recovered(itemId: String, state: ItemState, output: ContentEvidence?, diagnostic: String, now: Long)
 }
 interface AttemptLifecycle {
+    val claim: ClaimedItem? get() = null
     suspend fun created(work: AttemptWorkspace, source: ContentEvidence, planHash: String) {}
     suspend fun validated(receipt: ValidationReceipt) {}
     suspend fun publishing(prepared: PreparedCopy) {}
     suspend fun published(output: ContentEvidence) {}
 }
+fun interface TransactionRecovery { suspend fun recoverTransactions() }
 object NoopAttemptLifecycle : AttemptLifecycle
 fun interface ItemExecutor {
     suspend fun execute(plan: ResolvedPlan, stop: StopSignal, lifecycle: AttemptLifecycle, emit: (AttemptEvent) -> Unit): AttemptResult

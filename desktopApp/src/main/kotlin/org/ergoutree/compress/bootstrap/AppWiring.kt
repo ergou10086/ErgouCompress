@@ -13,6 +13,9 @@ import org.ergoutree.compress.infrastructure.process.*
 import org.ergoutree.compress.infrastructure.storage.SqlDelightJobStore
 import org.ergoutree.compress.platform.windows.WindowsProcessLauncher
 import org.ergoutree.compress.platform.windows.WindowsFileIdentity
+import org.ergoutree.compress.platform.windows.WindowsCommitFiles
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.emitAll
 import org.ergoutree.compress.ports.*
 import java.nio.file.*
 import java.util.UUID
@@ -39,8 +42,37 @@ class AppWiring(private val session: DesktopSession) : DesktopWorkflow {
     private val artifacts = NioCopyArtifacts(session.location.root.local(), files)
     private val copies = RunCopy(files, FfmpegEncoder(runner), FullMediaValidator(runner, probe, files), artifacts)
     private val catalog = session.own(SqlDelightJobStore(session.location.root.resolve("catalog/catalog.sqlite")))
-    val queue = QueueCoordinator(catalog, ItemExecutor { plan, stop, lifecycle, emit -> copies.execute(plan, stop, lifecycle, emit) }, files,
-        Clock { System.currentTimeMillis() }, IdGenerator { UUID.randomUUID().toString() })
+    private val commitFiles = if (windows) WindowsCommitFiles(session.location.root.local(), files) else null
+    val workspaceRegistry = commitFiles?.let { RegisteredWorkspaces(session.location.root.local(), catalog, it) }
+    val commitTransactions = commitFiles?.let { CommitCoordinator(catalog, catalog, it, files, workspaceRegistry!!,
+        Clock { System.currentTimeMillis() }, IdGenerator { UUID.randomUUID().toString() }) }
+    val queue = QueueCoordinator(catalog, ItemExecutor { plan, stop, lifecycle, emit ->
+        val publisher = commitTransactions?.let { JournaledArtifacts(artifacts, it, requireNotNull(lifecycle.claim)) } ?: artifacts
+        RunCopy(files, FfmpegEncoder(runner), FullMediaValidator(runner, probe, files), publisher).execute(plan, stop, lifecycle, emit)
+    }, files, Clock { System.currentTimeMillis() }, IdGenerator { UUID.randomUUID().toString() }, commitTransactions ?: TransactionRecovery { })
+    suspend fun commitHistory() = catalog.commits()
+    suspend fun prepareRequest(request: ProcessingRequest): FrozenJob {
+        val tools = validateTools(request.ffmpeg.ifBlank { savedTools.ffmpeg }, request.ffprobe.ifBlank { savedTools.ffprobe }, StopSignal())
+        val found = mutableListOf<ScannedMedia>(); var complete = false
+        scan(request.inputs, request.maxDepth, request.minimumBytes, if (request.mode == OutputMode.COPY) request.outputDirectory else "", tools, StopSignal()).collect {
+            if (it is ScanUpdate.Entry) found += it.item
+            if (it is ScanUpdate.Summary) complete = it.complete
+        }
+        require(complete) { "扫描不完整，不能创建任务" }
+        val selections = found.filter { it.eligible }.map { PlanningSelection(it.file, requireNotNull(it.media)) }
+        val budgetDirectory = if (request.mode == OutputMode.COPY) request.outputDirectory else session.location.root.toString()
+        val job = freezer.execute(UUID.randomUUID().toString(), selections, tools, request.settings, Path.of(budgetDirectory).local(), request.mode, request.onlyIfSmaller)
+        for (plan in job.plans) if (plan.outputMode != OutputMode.COPY) {
+            require(commitFiles != null && workspaceRegistry != null) { "当前平台尚无原地提交适配器" }
+            workspaceRegistry.forVolume(commitFiles.volume(plan.source.path))
+        }
+        withContext(Dispatchers.IO) {
+            val folder = Files.createDirectories(session.location.root.resolve("jobs/frozen"))
+            Files.writeString(folder.resolve("${job.id}.json"), SnapshotJson.encodeToString(job), StandardOpenOption.CREATE_NEW)
+            Files.writeString(folder.resolve("${job.id}-scan.json"), SnapshotJson.encodeToString(found.map { mapOf("path" to it.file.path.value, "selected" to it.eligible.toString(), "reason" to it.reason.orEmpty()) }))
+        }
+        return job
+    }
     private val config = session.location.root.resolve("config/tools.json")
     override val savedTools: SavedToolPaths = if (Files.exists(config)) {
         // Bad config is visible at startup, not silently replaced with an empty history.
@@ -63,8 +95,11 @@ class AppWiring(private val session: DesktopSession) : DesktopWorkflow {
 
     override fun scan(roots: List<String>, depth: Int?, minimumBytes: Long, output: String, tools: Toolchain, stop: StopSignal): Flow<ScanUpdate> {
         val exclusions = listOf(session.location.root.local()) + if (output.isNotBlank()) listOf(Path.of(output).toAbsolutePath().normalize().local()) else emptyList()
-        return scans.execute(ScanRequest(roots.map { Path.of(it).toAbsolutePath().normalize().local() }, depth, exclusions, minimumBytes), tools,
-            session.location.root.resolve("tmp").local(), stop)
+        return flow {
+            val managed = catalog.workspaces().map { it.root }
+            emitAll(scans.execute(ScanRequest(roots.map { Path.of(it).toAbsolutePath().normalize().local() }, depth, exclusions + managed, minimumBytes), tools,
+                session.location.root.resolve("tmp").local(), stop))
+        }
     }
     override suspend fun freeze(selection: List<PlanningSelection>, tools: Toolchain, settings: EncodeSettings, output: String): FrozenJob {
         val job = freezer.execute(UUID.randomUUID().toString(), selection, tools, settings, Path.of(output).local())

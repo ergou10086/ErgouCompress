@@ -2,6 +2,7 @@ package org.ergoutree.compress.testing
 
 import kotlinx.serialization.encodeToString
 import org.ergoutree.compress.application.SnapshotJson
+import org.ergoutree.compress.application.PlanEncoding
 import org.ergoutree.compress.domain.*
 import org.ergoutree.compress.infrastructure.files.*
 import org.ergoutree.compress.ports.*
@@ -18,12 +19,12 @@ class QueueFixture(val root: Path) {
             if (!Files.exists(source)) Files.writeString(source, "source-$index")
             samplePlan().copy(source = files.identity(source.local()), destination = output.resolve("$id-$index.mp4").local())
         }
-        return FrozenJob(id = id, plans = plans, planHash = files.sha256(SnapshotJson.encodeToString(plans)))
+        return FrozenJob(id = id, plans = plans, planHash = files.sha256(PlanEncoding.canonicalList(plans)))
     }
     suspend fun workspace(plan: ResolvedPlan, id: String): Pair<AttemptWorkspace, ValidationReceipt> {
         val dir = Files.createDirectories(root.resolve("attempts/$id"))
         val candidate = Files.writeString(dir.resolve("candidate.mp4"), "encoded-${plan.source.path.value}").local()
-        val receipt = ValidationReceipt(planHash = files.sha256(SnapshotJson.encodeToString(plan)), source = files.evidence(plan.source.path),
+        val receipt = ValidationReceipt(planHash = files.sha256(PlanEncoding.canonical(plan)), source = files.evidence(plan.source.path),
             candidate = files.evidence(candidate), outputMedia = plan.media, audioPacketDigests = emptyList(), fullDecodePassed = true)
         return AttemptWorkspace(id, dir.local(), candidate) to receipt
     }

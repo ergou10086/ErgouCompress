@@ -10,7 +10,8 @@ import org.ergoutree.compress.domain.*
 import org.ergoutree.compress.ports.*
 
 /** The owning desktop session holds the OS file lock throughout recovery and dispatch. */
-class QueueCoordinator(private val store: JobStore, private val executor: ItemExecutor, private val files: PlanEnvironment, private val clock: Clock, private val ids: IdGenerator) {
+class QueueCoordinator(private val store: JobStore, private val executor: ItemExecutor, private val files: PlanEnvironment, private val clock: Clock, private val ids: IdGenerator,
+    private val transactions: TransactionRecovery = TransactionRecovery { }) {
     private val worker = Mutex()
     private val control = Mutex()
     private var active: Pair<ClaimedItem, StopSignal>? = null
@@ -33,7 +34,9 @@ class QueueCoordinator(private val store: JobStore, private val executor: ItemEx
     suspend fun recover() = worker.withLock {
         recovered.value = false
         check(active == null)
-        for ((item, attempt) in store.recoveryItems()) {
+        transactions.recoverTransactions()
+        for ((item, attempt, superseded, journal) in store.recoveryItems()) {
+            if (superseded || journal) continue
             if (attempt == null) continue
             if (item.state == ItemState.SUCCEEDED || attempt.state in listOf(ExecutionState.PUBLISHING, ExecutionState.PUBLISHED, ExecutionState.NEEDS_ATTENTION)) {
                 val receipt = attempt.validation
@@ -63,6 +66,7 @@ class QueueCoordinator(private val store: JobStore, private val executor: ItemEx
                 control.withLock { active = claim to stop }
                 if (store.attempts(claim.item.id).last().stopRequested) stop.request()
                 val lifecycle = object : AttemptLifecycle {
+                    override val claim = claim
                     override suspend fun created(work: AttemptWorkspace, source: ContentEvidence, planHash: String) = store.workspace(claim, WorkspaceRecord(work.id, work.root, work.candidate, source, planHash), clock.nowMillis())
                     override suspend fun validated(receipt: ValidationReceipt) = store.validated(claim, receipt, clock.nowMillis())
                     override suspend fun publishing(prepared: PreparedCopy) = store.publishing(claim, clock.nowMillis())

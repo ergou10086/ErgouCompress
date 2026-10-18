@@ -3,6 +3,7 @@ package org.ergoutree.compress.infrastructure
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.encodeToString
 import org.ergoutree.compress.application.SnapshotJson
+import org.ergoutree.compress.application.PlanEncoding
 import org.ergoutree.compress.domain.*
 import org.ergoutree.compress.infrastructure.files.*
 import org.ergoutree.compress.ports.*
@@ -22,7 +23,7 @@ class CopyPublicationTest {
         val output = Files.createDirectory(root.resolve("output"))
         val files = NioEnvironment()
         val plan = samplePlan().copy(source = files.identity(source), destination = output.resolve("source.mp4").local())
-        val hash = files.sha256(SnapshotJson.encodeToString(plan))
+        val hash = files.sha256(PlanEncoding.canonical(plan))
         val store = NioCopyArtifacts(root.local(), files)
         val work = store.create(plan, hash)
         Files.writeString(work.candidate.nio(), "encoded-byte-fixture")

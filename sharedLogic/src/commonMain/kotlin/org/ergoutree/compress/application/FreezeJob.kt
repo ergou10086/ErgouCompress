@@ -10,7 +10,7 @@ val SnapshotJson = Json { encodeDefaults = true; ignoreUnknownKeys = true }
 data class PlanningSelection(val file: FileIdentity, val media: MediaInfo, val override: EncodeSettings? = null)
 
 class FreezeJob(private val environment: PlanEnvironment) {
-    suspend fun execute(id: String, selection: List<PlanningSelection>, tools: Toolchain, defaults: EncodeSettings, outputDirectory: LocalPath): FrozenJob {
+    suspend fun execute(id: String, selection: List<PlanningSelection>, tools: Toolchain, defaults: EncodeSettings, outputDirectory: LocalPath, mode: OutputMode = OutputMode.COPY, onlyIfSmaller: Boolean = true): FrozenJob {
         require(selection.isNotEmpty()) { "请先选择至少一个合格文件" }
         val plans = selection.map { selected ->
             val settings = selected.override ?: defaults
@@ -22,9 +22,15 @@ class FreezeJob(private val environment: PlanEnvironment) {
                 else -> throw CompressException(ErrorCode.UNSUPPORTED_MEDIA, "源容器尚不支持，请明确选择 MP4 或 MKV 副本")
             }
             MediaPolicy.rejection(selected.media, container)?.let { throw CompressException(ErrorCode.UNSUPPORTED_MEDIA, it) }
-            val target = environment.target(outputDirectory, selected.file.path, container)
-            if (environment.exists(target)) throw CompressException(ErrorCode.DESTINATION_CONFLICT, "目标已存在：${target.value}")
-            ResolvedPlan(source = selected.file, media = selected.media, tools = tools, settings = settings, container = container, destination = target)
+            val target = when (mode) {
+                OutputMode.REPLACE -> selected.file.path
+                OutputMode.CHANGE_EXTENSION -> LocalPath(selected.file.path.value.substringBeforeLast('.') + "." + container.extension)
+                OutputMode.COPY -> environment.target(outputDirectory, selected.file.path, container)
+            }
+            if (mode == OutputMode.CHANGE_EXTENSION && target == selected.file.path) throw CompressException(ErrorCode.DESTINATION_CONFLICT, "改扩展名模式需要不同的目标扩展名")
+            if (mode == OutputMode.REPLACE && !selected.file.path.value.endsWith(".${container.extension}", true)) throw CompressException(ErrorCode.UNSUPPORTED_MEDIA, "同名替换不能改扩展名")
+            if (mode != OutputMode.REPLACE && environment.exists(target)) throw CompressException(ErrorCode.DESTINATION_CONFLICT, "目标已存在：${target.value}")
+            ResolvedPlan(schemaVersion = 2, plannerVersion = 2, source = selected.file, media = selected.media, tools = tools, settings = settings, container = container, destination = target, outputMode = mode, onlyIfSmaller = onlyIfSmaller)
         }
         // target() returns filesystem-normalized paths; aliases are checked by the adapter.
         if (plans.map { it.destination.value.lowercase() }.distinct().size != plans.size) throw CompressException(ErrorCode.DESTINATION_CONFLICT, "多个输入映射到同一个目标，请分开任务或选择其他目录")
@@ -39,6 +45,6 @@ class FreezeJob(private val environment: PlanEnvironment) {
             throw CompressException(ErrorCode.INSUFFICIENT_SPACE, "输出卷需要至少两倍输入大小及 64 MiB 安全余量（保守预算，非输出体积保证）")
         // Round-trip creates an owned deep snapshot, independent of mutable scan/UI collections.
         val owned = SnapshotJson.decodeFromString<List<ResolvedPlan>>(SnapshotJson.encodeToString(plans))
-        return FrozenJob(id = id, plans = owned, planHash = environment.sha256(SnapshotJson.encodeToString(owned)))
+        return FrozenJob(id = id, plans = owned, planHash = environment.sha256(PlanEncoding.canonicalList(owned)))
     }
 }

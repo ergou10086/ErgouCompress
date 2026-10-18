@@ -97,4 +97,20 @@ class MediaIntegrationTest {
             assertTrue(Files.exists(f.archive.nio().resolve("config/tools.json")))
         }
     }
+    @Test fun realMediaReplacementAndOriginalRestoreUseAuthoritativeReceipt(): Unit = runBlocking {
+        Assume.assumeTrue(System.getProperty("os.name").startsWith("Windows"))
+        val f = fixture(); val before = f.files.evidence(f.source)
+        DesktopBootstrap.open(f.archive.value).use { session ->
+            val app = AppWiring(session)
+            val job = app.prepareRequest(ProcessingRequest(listOf(f.source.value), f.tools.ffmpeg.path.value, f.tools.ffprobe.path.value,
+                mode = OutputMode.REPLACE, onlyIfSmaller = false))
+            app.queue.submit(job); app.queue.recover()
+            val result = app.queue.run(job.id).single()
+            assertEquals(AttemptStage.SUCCEEDED, result.stage, result.message)
+            val commit = app.commitHistory().single(); assertEquals(CommitPhase.COMMITTED, commit.phase)
+            assertEquals(before.sha256, f.files.evidence(commit.backup!!).sha256)
+            app.commitTransactions!!.restore(commit.id)
+            assertEquals(before.sha256, f.files.evidence(f.source).sha256)
+        }
+    }
 }

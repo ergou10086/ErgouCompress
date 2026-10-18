@@ -19,7 +19,7 @@ class RunCopy(
         try {
             emit(AttemptEvent(AttemptStage.PREPARING, "核对工具、源文件与工作空间"))
             stop.checkRunning()
-            val hash = environment.sha256(SnapshotJson.encodeToString(plan))
+            val hash = environment.sha256(PlanEncoding.canonical(plan))
             if (environment.identity(plan.source.path) != plan.source) throw CompressException(ErrorCode.INPUT_CHANGED, "源文件已变化，请重新扫描规划")
             for (tool in listOf(plan.tools.ffmpeg, plan.tools.ffprobe)) {
                 if (environment.evidence(tool.path).sha256 != tool.sha256) throw CompressException(ErrorCode.TOOLCHAIN_INVALID, "工具二进制已变化，请重新自检")
@@ -51,7 +51,7 @@ class RunCopy(
             throw cancelled
         } catch (failure: Exception) {
             val code = (failure as? CompressException)?.code ?: ErrorCode.PROCESS_FAILED
-            val stage = if (code == ErrorCode.USER_INTERRUPTED) AttemptStage.INTERRUPTED else AttemptStage.FAILED
+            val stage = when (code) { ErrorCode.USER_INTERRUPTED -> AttemptStage.INTERRUPTED; ErrorCode.NO_BENEFIT -> AttemptStage.SKIPPED; else -> AttemptStage.FAILED }
             val message = "${failure.message ?: code.name}${work?.let { "；候选与诊断保留于 ${it.root.value}" } ?: ""}"
             work?.let { current ->
                 // Recording failure is best effort; never conceals the original error.

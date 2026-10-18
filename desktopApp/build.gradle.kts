@@ -40,6 +40,7 @@ tasks.withType<JavaExec>().configureEach {
 }
 
 tasks.withType<Test>().configureEach {
+    systemProperty("ergou.test.runtimeClasspath", sourceSets["test"].runtimeClasspath.asPath)
     if (providers.gradleProperty("mediaTests").orNull != "true") exclude("**/MediaIntegrationTest*")
     environment("ERGOU_TEST_FFMPEG", providers.environmentVariable("ERGOU_TEST_FFMPEG").orNull ?: "")
     environment("ERGOU_TEST_FFPROBE", providers.environmentVariable("ERGOU_TEST_FFPROBE").orNull ?: "")

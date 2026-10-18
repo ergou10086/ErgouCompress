@@ -1,0 +1,27 @@
+CREATE TABLE commit_log (
+    id TEXT NOT NULL PRIMARY KEY,
+    item_id TEXT NOT NULL REFERENCES item(id),
+    attempt_id TEXT UNIQUE REFERENCES attempt(id),
+    restore_of TEXT REFERENCES commit_log(id),
+    phase TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE workspace (
+    id TEXT NOT NULL PRIMARY KEY,
+    volume_id TEXT NOT NULL UNIQUE,
+    root TEXT NOT NULL UNIQUE
+);
+
+insertCommit:
+INSERT INTO commit_log(id,item_id,attempt_id,restore_of,phase,payload) VALUES(?,?,?,?,?,?);
+findCommit:
+SELECT * FROM commit_log WHERE id = ?;
+listCommits:
+SELECT * FROM commit_log ORDER BY rowid;
+updateCommit:
+UPDATE commit_log SET phase = ?, payload = ?, revision = revision + 1 WHERE id = ? AND revision = ?;
+insertWorkspace:
+INSERT INTO workspace(id,volume_id,root) VALUES(?,?,?);
+listWorkspaces:
+SELECT * FROM workspace;
