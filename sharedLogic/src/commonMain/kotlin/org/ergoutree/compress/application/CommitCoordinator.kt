@@ -1,5 +1,10 @@
 package org.ergoutree.compress.application
 
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.ergoutree.compress.domain.*
@@ -70,6 +75,7 @@ class CommitCoordinator(private val store: CommitStore, private val jobs: JobSto
     }
     private suspend fun advance(initial: CommitRecord, continuePrepared: Boolean): CommitRecord {
         var record = initial
+        if (record.phase == CommitPhase.CANCELLED) throw CompressException(ErrorCode.USER_INTERRUPTED, "恢复操作已持久化取消")
         require(files.volume(record.workspace.root).id == record.workspace.volumeId) { "工作区离线或换卷" }
         val target = files.evidence(record.plan.destination)
         val backup = record.backup?.let { files.evidence(it) }
@@ -140,22 +146,42 @@ class CommitCoordinator(private val store: CommitStore, private val jobs: JobSto
         require(matches(backup, original.source)) { "原始备份已变化" }
         val workspace = registry.forVolume(files.volume(original.plan.destination))
         val newId = ids.next(); val dir = files.prepareDirectory(workspace.root, newId)
-        val staged = child(dir, "restore.${original.plan.container.extension}")
+        val extensionRestore = original.plan.outputMode == OutputMode.CHANGE_EXTENSION
+        val target = if (extensionRestore) original.source.identity.path else original.plan.destination
+        if (extensionRestore && files.evidence(target) != null) throw CompressException(ErrorCode.DESTINATION_CONFLICT, "原路径已有其他文件，不能恢复覆盖")
+        val restoredContainer = if (extensionRestore) when {
+            target.value.endsWith(".mp4", true) -> Container.MP4
+            target.value.endsWith(".mkv", true) -> Container.MKV
+            else -> throw CompressException(ErrorCode.UNSUPPORTED_MEDIA, "原扩展名恢复尚未支持")
+        } else original.plan.container
+        val staged = child(dir, "restore.${restoredContainer.extension}")
         files.copy(original.backup, staged, stop) // Never consume the only original backup.
         files.prepareMetadata(original.backup, staged, original.sourceMetadata)
         val current = requireNotNull(files.evidence(original.plan.destination))
-        val plan = original.plan.copy(schemaVersion = 2, plannerVersion = 2, source = current.identity, destination = current.identity.path, outputMode = OutputMode.REPLACE, onlyIfSmaller = false)
+        val plan = original.plan.copy(schemaVersion = maxOf(2, original.plan.schemaVersion), plannerVersion = maxOf(2, original.plan.plannerVersion), source = current.identity, destination = target, container = restoredContainer, outputMode = if (extensionRestore) OutputMode.CHANGE_EXTENSION else OutputMode.REPLACE, onlyIfSmaller = false)
         val record = CommitRecord(id = newId, itemId = original.itemId, attemptId = null, restoreOf = original.id, plan = plan, receipt = null,
             source = current, candidate = backup, staged = requireNotNull(files.evidence(staged)), backup = child(dir, "previous.backup"), workspace = workspace,
             sourceMetadata = files.metadata(current.identity.path), targetMetadata = original.sourceMetadata)
-        store.createCommit(record, null, clock.nowMillis()); files.mirror(record)
-        stop.checkRunning()
-        return stop.publish { gate.withLock { advance(record, true) } }
+        try {
+            store.createCommit(record, null, clock.nowMillis()); files.mirror(record)
+            currentCoroutineContext().ensureActive()
+            return withContext(NonCancellable) { stop.publish { gate.withLock { advance(record, true) } } }
+        } catch (cancelled: CancellationException) {
+            cancelPreparedRestore(record.id)
+            throw cancelled
+        } catch (stopped: CompressException) {
+            if (stopped.code == ErrorCode.USER_INTERRUPTED) cancelPreparedRestore(record.id)
+            throw stopped
+        }
+    }
+    private suspend fun cancelPreparedRestore(id: String) = withContext(NonCancellable) {
+        store.commits().firstOrNull { it.id == id && it.phase == CommitPhase.PREPARED }?.let { durable(it.copy(phase = CommitPhase.CANCELLED)) }
     }
     override suspend fun recoverTransactions() = gate.withLock {
         val records = store.commits()
         val superseded = records.filter { it.phase == CommitPhase.COMMITTED }.mapNotNull { it.restoreOf }.toSet()
         for (record in records) {
+            if (record.phase == CommitPhase.CANCELLED) continue
             if (record.id in superseded) continue
             if (record.phase != CommitPhase.COMMITTED && !store.canResumeCommit(record)) {
                 if (record.attemptId != null) jobs.recovered(record.itemId, ItemState.INTERRUPTED, null, "停止请求保留；旧提交候选不会自动发布", clock.nowMillis())

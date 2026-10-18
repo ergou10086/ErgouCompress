@@ -16,8 +16,25 @@ data class EncodeSettings(
     val quality: Int = 23,
     val speed: Speed = Speed.BALANCED,
     val container: Container? = null,
+    val operation: MediaOperation = MediaOperation.ENCODE,
+    val streams: List<StreamPolicy> = emptyList(),
+    val maxWidth: Int? = null,
+    val maxHeight: Int? = null,
+    val frameRate: Rational? = null,
+    val rateControl: RateControl = RateControl.QUALITY,
+    val videoBitrateKbps: Int? = null,
+    val preserveMetadata: Boolean = true,
+    val preserveChapters: Boolean = true,
 ) {
-    init { require(quality in 0..51) { "质量值必须为 0–51" } }
+    init {
+        require(quality in 0..51) { "质量值必须为 0–51" }
+        require(maxWidth == null || maxWidth in 2..16384 && maxWidth % 2 == 0)
+        require(maxHeight == null || maxHeight in 2..16384 && maxHeight % 2 == 0)
+        require(frameRate == null || frameRate.numerator.toDouble() / frameRate.denominator in 1.0..240.0)
+        require((rateControl == RateControl.BITRATE) == (videoBitrateKbps != null)) { "码率模式需要明确视频码率；质量模式不接受码率覆盖" }
+        require(videoBitrateKbps == null || videoBitrateKbps in 16..200_000)
+        require(streams.map { it.sourceIndex }.distinct().size == streams.size) { "每条流只能指定一次策略" }
+    }
 }
 
 @Serializable
@@ -32,6 +49,7 @@ data class Toolchain(
     val ffprobe: ToolBinary,
     val checks: List<BackendCheck>,
     val buildConfiguration: String,
+    val aacAvailable: Boolean = false,
 ) {
     fun supports(backend: Backend): Boolean = checks.any { it.backend == backend && it.available }
 }
@@ -51,7 +69,10 @@ data class ResolvedPlan(
     val onlyIfSmaller: Boolean = true,
     val preserveSourceTime: Boolean = true,
 ) {
-    init { require(outputMode == OutputMode.COPY || plannerVersion >= 2) { "原地计划需要 plannerVersion >= 2" } }
+    init {
+        require(outputMode == OutputMode.COPY || plannerVersion >= 2) { "原地计划需要 plannerVersion >= 2" }
+        require(plannerVersion >= 3 || settings == EncodeSettings(settings.backend, settings.quality, settings.speed, settings.container)) { "扩展媒体参数需要 plannerVersion >= 3" }
+    }
 }
 
 @Serializable
@@ -77,7 +98,7 @@ data class Progress(val outTimeUs: Long?, val totalBytes: Long?, val speed: Doub
         if (outTimeUs != null && durationUs != null && durationUs > 0) (outTimeUs.toDouble() / durationUs).coerceIn(0.0, 1.0) else null
 }
 
-data class AttemptEvent(val stage: AttemptStage, val message: String, val progress: Progress? = null)
+data class AttemptEvent(val stage: AttemptStage, val message: String, val progress: Progress? = null, val sizeEstimate: SizeEstimate? = null)
 data class AttemptResult(val stage: AttemptStage, val destination: LocalPath? = null, val error: ErrorCode? = null, val message: String)
 
 object MediaPolicy {

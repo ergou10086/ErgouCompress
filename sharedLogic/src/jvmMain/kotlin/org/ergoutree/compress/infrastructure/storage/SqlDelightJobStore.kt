@@ -91,7 +91,7 @@ class SqlDelightJobStore(path: Path) : JobStore, CommitStore, AutoCloseable {
         }
         q.insertJob(job.id, SnapshotJson.encodeToString(job), JobState.READY.name, now)
         job.plans.forEachIndexed { index, plan ->
-            require(plan.schemaVersion in 1..2 && plan.plannerVersion in 1..2) { "不支持的计划版本" }
+            require(plan.schemaVersion in 1..3 && plan.plannerVersion in 1..3) { "不支持的计划版本" }
             val itemId = "${job.id}:$index"
             q.insertItem(itemId, job.id, index.toLong(), SnapshotJson.encodeToString(plan), ItemState.READY.name)
             val target = Path.of(plan.destination.value).toAbsolutePath().normalize().toString().lowercase()
@@ -226,7 +226,9 @@ class SqlDelightJobStore(path: Path) : JobStore, CommitStore, AutoCloseable {
         } else {
             val parent = SnapshotJson.decodeFromString<CommitRecord>(commits.findCommit(record.restoreOf).executeAsOne().payload)
             require(parent.phase == CommitPhase.COMMITTED && itemRow(parent.itemId).state == "SUCCEEDED") { "仅完成且未在执行的版本可恢复" }
-            require(record.source == parent.output && record.candidate.sha256 == parent.source.sha256 && record.plan.destination == parent.plan.destination)
+            val expectedTarget = if (parent.plan.outputMode == OutputMode.CHANGE_EXTENSION) parent.source.identity.path else parent.plan.destination
+            require(record.source == parent.output && record.candidate.sha256 == parent.source.sha256 && record.plan.destination == expectedTarget)
+            require(record.plan.source.path == parent.plan.destination)
             val target = Path.of(record.plan.destination.value).toAbsolutePath().normalize().toString().lowercase()
             require(q.findReservation(target).executeAsOneOrNull() == null) { "目标正由其他任务预留" }
             q.reserveTarget(target, record.itemId)
@@ -237,6 +239,7 @@ class SqlDelightJobStore(path: Path) : JobStore, CommitStore, AutoCloseable {
     override suspend fun saveCommit(record: CommitRecord, now: Long): CommitRecord = write {
         val updated = record.copy(revision = record.revision + 1)
         check(commits.updateCommit(updated.phase.name, SnapshotJson.encodeToString(updated), record.id, record.revision).value == 1L) { "提交 revision 过期" }
+        if (updated.phase == CommitPhase.CANCELLED && updated.restoreOf != null) q.releaseTarget(updated.itemId)
         if (updated.phase == CommitPhase.COMMITTED && updated.restoreOf != null) { q.markSuperseded(updated.itemId); q.releaseTarget(updated.itemId) }
         event(itemRow(updated.itemId).job_id, updated.itemId, "Commit${updated.phase}", updated.id, now)
         updated
@@ -251,8 +254,8 @@ class SqlDelightJobStore(path: Path) : JobStore, CommitStore, AutoCloseable {
     }
     override suspend fun workspaces() = read { commits.listWorkspaces().executeAsList().map { Workspace(it.id, LocalPath(it.root), it.volume_id) } }
     override suspend fun canResumeCommit(record: CommitRecord) = read {
-        record.attemptId == null || q.findAttempt(record.attemptId).executeAsOne().let {
+        record.phase != CommitPhase.CANCELLED && (record.attemptId == null || q.findAttempt(record.attemptId).executeAsOne().let {
             it.stop_requested == 0L && (jobRow(itemRow(record.itemId).job_id).state != "CANCELLED" || it.state in listOf("PUBLISHING", "PUBLISHED", "SUCCEEDED"))
-        }
+        })
     }
 }

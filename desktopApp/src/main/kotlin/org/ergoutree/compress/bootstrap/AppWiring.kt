@@ -8,6 +8,7 @@ import kotlinx.serialization.encodeToString
 import org.ergoutree.compress.application.*
 import org.ergoutree.compress.domain.*
 import org.ergoutree.compress.infrastructure.ffmpeg.*
+import org.ergoutree.compress.infrastructure.analysis.*
 import org.ergoutree.compress.infrastructure.files.*
 import org.ergoutree.compress.infrastructure.process.*
 import org.ergoutree.compress.infrastructure.storage.SqlDelightJobStore
@@ -50,6 +51,8 @@ class AppWiring(private val session: DesktopSession) : DesktopWorkflow {
         val publisher = commitTransactions?.let { JournaledArtifacts(artifacts, it, requireNotNull(lifecycle.claim)) } ?: artifacts
         RunCopy(files, FfmpegEncoder(runner), FullMediaValidator(runner, probe, files), publisher).execute(plan, stop, lifecycle, emit)
     }, files, Clock { System.currentTimeMillis() }, IdGenerator { UUID.randomUUID().toString() }, commitTransactions ?: TransactionRecovery { })
+    private val analysis = AnalyzeMedia(files, FfmpegMediaSampler(runner, probe, session.location.root.resolve("analysis/artifacts").local()), JsonAnalysisCache(session.location.root.resolve("analysis/cache")))
+    suspend fun analyze(plan: ResolvedPlan, options: AnalysisOptions = AnalysisOptions(), stop: StopSignal = StopSignal()) = analysis.execute(plan, options, stop)
     suspend fun commitHistory() = catalog.commits()
     suspend fun prepareRequest(request: ProcessingRequest): FrozenJob {
         val tools = validateTools(request.ffmpeg.ifBlank { savedTools.ffmpeg }, request.ffprobe.ifBlank { savedTools.ffprobe }, StopSignal())
@@ -59,7 +62,14 @@ class AppWiring(private val session: DesktopSession) : DesktopWorkflow {
             if (it is ScanUpdate.Summary) complete = it.complete
         }
         require(complete) { "扫描不完整，不能创建任务" }
-        val selections = found.filter { it.eligible }.map { PlanningSelection(it.file, requireNotNull(it.media)) }
+        val reviewed = found.map { entry ->
+            val media = entry.media ?: return@map entry
+            val container = request.settings.container ?: if (media.format.split(',').contains("matroska")) Container.MKV else if (media.format.split(',').contains("mp4")) Container.MP4 else null
+            val reason = if (container == null) "请明确选择 MP4 或 MKV" else MediaStrategy.rejection(media, request.settings, container)
+            entry.copy(eligible = reason == null, reason = reason)
+        }
+        val selections = reviewed.filter { it.eligible }.map { PlanningSelection(it.file, requireNotNull(it.media)) }
+        require(selections.isNotEmpty()) { "没有合格输入：" + reviewed.joinToString { "${it.file.path.value}: ${it.reason}" } }
         val budgetDirectory = if (request.mode == OutputMode.COPY) request.outputDirectory else session.location.root.toString()
         val job = freezer.execute(UUID.randomUUID().toString(), selections, tools, request.settings, Path.of(budgetDirectory).local(), request.mode, request.onlyIfSmaller)
         for (plan in job.plans) if (plan.outputMode != OutputMode.COPY) {
@@ -69,7 +79,7 @@ class AppWiring(private val session: DesktopSession) : DesktopWorkflow {
         withContext(Dispatchers.IO) {
             val folder = Files.createDirectories(session.location.root.resolve("jobs/frozen"))
             Files.writeString(folder.resolve("${job.id}.json"), SnapshotJson.encodeToString(job), StandardOpenOption.CREATE_NEW)
-            Files.writeString(folder.resolve("${job.id}-scan.json"), SnapshotJson.encodeToString(found.map { mapOf("path" to it.file.path.value, "selected" to it.eligible.toString(), "reason" to it.reason.orEmpty()) }))
+            Files.writeString(folder.resolve("${job.id}-scan.json"), SnapshotJson.encodeToString(reviewed.map { mapOf("path" to it.file.path.value, "selected" to it.eligible.toString(), "reason" to it.reason.orEmpty()) }))
         }
         return job
     }

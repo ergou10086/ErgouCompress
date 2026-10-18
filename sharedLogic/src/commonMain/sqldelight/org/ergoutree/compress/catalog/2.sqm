@@ -1,0 +1,2 @@
+-- Schema v3 also forms the minimum-reader boundary for planner v3 / restore CANCELLED.
+CREATE INDEX item_dispatch ON item(job_id, state, ordinal);

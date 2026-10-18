@@ -54,6 +54,9 @@ data class MediaStream(
     val sideDataTypes: List<String> = emptyList(),
     val tags: Map<String, String> = emptyMap(),
     val dispositions: Map<String, Int> = emptyMap(),
+    val bitrateBps: Long? = null,
+    val sampleAspectRatio: Rational? = null,
+    val extradataHash: String? = null,
 )
 
 @Serializable

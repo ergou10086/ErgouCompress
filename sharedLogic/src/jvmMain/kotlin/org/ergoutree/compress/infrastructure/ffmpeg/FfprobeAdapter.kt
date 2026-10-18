@@ -8,9 +8,12 @@ import java.math.RoundingMode
 
 class FfprobeAdapter(private val runner: ProcessRunner) : MediaProbe {
     override suspend fun inspect(path: LocalPath, tools: Toolchain, work: LocalPath, stop: StopSignal): MediaInfo {
-        val result = runner.run(ProcessRequest(listOf(tools.ffprobe.path.value, "-v", "error", "-protocol_whitelist", "file,pipe", "-show_format", "-show_streams", "-show_chapters", "-of", "json", path.value), work), stop)
+        val result = runner.run(ProcessRequest(listOf(tools.ffprobe.path.value, "-v", "error", "-protocol_whitelist", "file,pipe", "-show_data_hash", "sha256", "-show_format", "-show_streams", "-show_chapters", "-of", "json", path.value), work), stop)
         requireProcess(result, ErrorCode.UNSUPPORTED_MEDIA, "媒体探测失败")
         if (result.stdoutTruncated) throw CompressException(ErrorCode.UNSUPPORTED_MEDIA, "ffprobe 输出超过上限")
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            java.nio.file.Files.writeString(java.nio.file.Path.of(work.value, "probe-${java.util.UUID.randomUUID()}.json"), result.stdout)
+        }
         return parse(result.stdout)
     }
 
@@ -32,6 +35,9 @@ class FfprobeAdapter(private val runner: ProcessRunner) : MediaProbe {
                     colorPrimaries = s.text("color_primaries"), colorSpace = s.text("color_space"), colorRange = s.text("color_range"), fieldOrder = s.text("field_order"),
                     sideDataTypes = s["side_data_list"]?.jsonArray.orEmpty().mapNotNull { it.jsonObject.text("side_data_type") },
                     tags = s.tags(), dispositions = dispositions,
+                    bitrateBps = s.text("bit_rate")?.toLongOrNull()?.takeIf { it > 0 },
+                    sampleAspectRatio = Rational.parse(s.text("sample_aspect_ratio")?.replace(':', '/')),
+                    extradataHash = s.text("extradata_hash"),
                 )
             },
             chapters = root["chapters"]?.jsonArray.orEmpty().map {

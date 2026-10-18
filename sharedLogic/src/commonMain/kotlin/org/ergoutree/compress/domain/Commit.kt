@@ -2,7 +2,7 @@ package org.ergoutree.compress.domain
 
 import kotlinx.serialization.Serializable
 
-@Serializable enum class CommitPhase { PREPARED, PUBLISH_INTENT, PUBLISHED, RETIRE_INTENT, RETIRED, COMMITTED, NEEDS_ATTENTION }
+@Serializable enum class CommitPhase { PREPARED, PUBLISH_INTENT, PUBLISHED, RETIRE_INTENT, RETIRED, COMMITTED, NEEDS_ATTENTION, CANCELLED }
 @Serializable data class VolumeInfo(val id: String, val root: LocalPath, val fileSystem: String, val local: Boolean)
 @Serializable data class Workspace(val id: String, val root: LocalPath, val volumeId: String)
 @Serializable data class FileMetadata(val modifiedTime: String, val createdTime: String, val dacl: String, val daclHash: String, val protectedDacl: Boolean, val adsHashes: Map<String, String>)

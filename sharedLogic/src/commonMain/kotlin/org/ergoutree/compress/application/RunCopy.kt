@@ -28,7 +28,8 @@ class RunCopy(
             work = artifacts.create(plan, hash)
             lifecycle.created(work, source, hash)
             emit(AttemptEvent(AttemptStage.ENCODING, "编码到独立候选，不修改源文件"))
-            encoder.encode(plan, work.candidate, work.root, stop) { emit(AttemptEvent(AttemptStage.ENCODING, "编码中", it)) }
+            val prediction = DynamicSizePredictor(plan.media.durationUs)
+            encoder.encode(plan, work.candidate, work.root, stop) { emit(AttemptEvent(AttemptStage.ENCODING, "编码中", it, prediction.update(it))) }
             stop.checkRunning()
             emit(AttemptEvent(AttemptStage.VALIDATING, "完整解码、流与音频包校验"))
             val receipt = validator.validate(plan, hash, source, work.candidate, work.root, stop)
@@ -44,8 +45,9 @@ class RunCopy(
                     artifacts.publish(prepared).also { lifecycle.published(environment.evidence(it)) }
                 }
             }
-            val result = AttemptResult(AttemptStage.SUCCEEDED, destination, message = "副本已发布，源文件保留；档案：${work.root.value}")
-            emit(AttemptEvent(result.stage, result.message))
+            val result = AttemptResult(AttemptStage.SUCCEEDED, destination, message = "已按冻结计划验证并发布；档案：${work.root.value}")
+            val actual = receipt.candidate.identity.sizeBytes
+            emit(AttemptEvent(result.stage, result.message, sizeEstimate = SizeEstimate(EstimateBasis.ACTUAL, actual, actual, actual, "候选已关闭、完整验证并发布；实际文件字节数")))
             return result
         } catch (cancelled: CancellationException) {
             throw cancelled

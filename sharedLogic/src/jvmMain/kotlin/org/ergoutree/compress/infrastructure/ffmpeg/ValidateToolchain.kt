@@ -43,7 +43,12 @@ class ValidateToolchain(private val runner: ProcessRunner, private val environme
                 BackendCheck(backend, diagnostic == "真实短片编码及 ffprobe 通过", diagnostic)
             }
         }
-        val result = base.copy(checks = checks)
+        val aacOutput = work.nio().resolve("aac.m4a").local()
+        val aacRun = runner.run(ProcessRequest(listOf(ff.path.value, "-hide_banner", "-nostdin", "-n", "-f", "lavfi", "-i", "sine=sample_rate=48000", "-t", "0.5", "-c:a", "aac", "-b:a", "192k", aacOutput.value), work,
+            logPrefix = work.nio().resolve("aac").local()), stop)
+        if (aacRun.stopped) stop.checkRunning()
+        val aacAvailable = aacRun.exitCode == 0 && !aacRun.timedOut && FfprobeAdapter(runner).inspect(aacOutput, base, work, stop).streams.any { it.kind == StreamKind.AUDIO && it.codec == "aac" && it.sampleRate == 48000 }
+        val result = base.copy(checks = checks, aacAvailable = aacAvailable)
         if (!result.supports(Backend.X264)) throw CompressException(ErrorCode.TOOLCHAIN_INVALID, "CPU 基础编码自检失败：${checks.first().diagnostic}")
         Files.writeString(work.nio().resolve("capabilities.json"), SnapshotJson.encodeToString(result))
         result

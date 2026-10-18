@@ -45,6 +45,18 @@ class CommitTransactionTest {
             assertEquals(input.receipt.source.sha256, f.environment.evidence(record.backup!!).sha256)
             val types = f.store.events("fixture").map { it.type }
             assertTrue(types.indexOf("CommitRETIRE_INTENT") > types.indexOf("CommitPUBLISH_INTENT"))
+            Files.writeString(input.plan.source.path.nio(), "external conflict")
+            assertFailsWith<CompressException> { coordinator.restore(record.id) }
+            assertEquals("external conflict", Files.readString(input.plan.source.path.nio()))
+            Files.delete(input.plan.source.path.nio()) // Remove only the test-created conflict.
+            val restored = coordinator.restore(record.id)
+            assertEquals(input.plan.source.path, restored.plan.destination)
+            assertEquals(input.receipt.source.sha256, f.environment.evidence(restored.plan.destination).sha256)
+            assertFalse(Files.exists(target.nio()))
+            assertEquals(input.receipt.candidate.sha256, f.environment.evidence(restored.backup!!).sha256)
+            assertEquals(input.receipt.source.sha256, f.environment.evidence(record.backup!!).sha256)
+            coordinator.recoverTransactions()
+            assertEquals(CommitPhase.COMMITTED, f.store.commit(restored.id).phase)
         }
     }
     @Test fun copyKeepsOriginalAndRestoreNeverConsumesUniqueBackup(): Unit = runBlocking {
@@ -192,6 +204,26 @@ class CommitTransactionTest {
             while (sourceDir.toString().length < 400) sourceDir = sourceDir.resolve("中文长路径_abcdefghijklmnop")
             val input = f.input(sourceDirectory = sourceDir); val coordinator = f.coordinator(); val record = coordinator.prepare(input.claim, input.plan, input.receipt, StopSignal())
             f.publish(coordinator, record, input.claim); assertEquals(CommitPhase.COMMITTED, f.store.commit(record.id).phase)
+        }
+    }
+    @Test fun stoppedRestoreIsDurableAndNeverAutoPublishedOnStartup(): Unit = runBlocking {
+        fixture().use { f ->
+            val input = f.input(); val coordinator = f.coordinator()
+            val original = coordinator.prepare(input.claim, input.plan, input.receipt, StopSignal())
+            f.publish(coordinator, original, input.claim)
+            val stopped = StopSignal()
+            val files = object : CommitFiles by f.native {
+                override suspend fun mirror(record: CommitRecord) {
+                    f.native.mirror(record)
+                    if (record.restoreOf != null && record.phase == CommitPhase.PREPARED) stopped.request()
+                }
+            }
+            assertEquals(ErrorCode.USER_INTERRUPTED, assertFailsWith<CompressException> { f.coordinator(files).restore(original.id, stopped) }.code)
+            assertEquals(CommitPhase.CANCELLED, f.store.commits().single { it.restoreOf != null }.phase)
+            coordinator.recoverTransactions()
+            assertEquals(input.receipt.candidate.sha256, f.environment.evidence(input.plan.destination).sha256)
+            coordinator.restore(original.id) // Reservation was released, explicit new restore remains possible.
+            assertEquals(input.receipt.source.sha256, f.environment.evidence(input.plan.destination).sha256)
         }
     }
 }
