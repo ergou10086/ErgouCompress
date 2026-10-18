@@ -13,18 +13,20 @@ import org.ergoutree.compress.domain.*
 import org.ergoutree.compress.domain.Workspace
 import org.ergoutree.compress.ports.JobStore
 import org.ergoutree.compress.ports.CommitStore
+import org.ergoutree.compress.ports.MaintenanceStore
 import java.nio.file.Files
 import java.nio.file.Path
 import java.security.MessageDigest
 import java.util.Properties
 
-/** One serialized writer, short SQL transactions, no media I/O inside a transaction. */
-class SqlDelightJobStore(path: Path) : JobStore, CommitStore, AutoCloseable {
+/** 串行化短数据库事务，统一保存任务、提交与清理意图，媒体 I/O 始终在事务外。 */
+class SqlDelightJobStore(path: Path) : JobStore, CommitStore, MaintenanceStore, AutoCloseable {
     private val gate = Mutex()
     private val driver: JdbcSqliteDriver
     private val database: CatalogDatabase
     private val q get() = database.catalogQueries
     private val commits get() = database.commitLogQueries
+    private val maintenance get() = database.maintenanceQueries
     init {
         Files.createDirectories(path.toAbsolutePath().parent)
         driver = JdbcSqliteDriver("jdbc:sqlite:${path.toAbsolutePath()}", Properties().apply {
@@ -126,7 +128,7 @@ class SqlDelightJobStore(path: Path) : JobStore, CommitStore, AutoCloseable {
         q.updateJob("PAUSE_REQUESTED", jobId)
         if (immediate) q.listItems(jobId).executeAsList().filter { it.state == "RUNNING" }.forEach { item ->
             val attempt = q.findAttempt(item.active_attempt!!).executeAsOne()
-            // Publication is a durable point of no cancellation. Pause only future dispatch.
+            // 发布意图持久化后不可中途取消；暂停仅影响后续派发。
             if (attempt.state !in listOf("PUBLISHING", "PUBLISHED")) q.stopAttempt(attempt.id)
         }
         event(jobId, null, if (immediate) "StopRequested" else "PauseRequested", "", now)
@@ -257,5 +259,71 @@ class SqlDelightJobStore(path: Path) : JobStore, CommitStore, AutoCloseable {
         record.phase != CommitPhase.CANCELLED && (record.attemptId == null || q.findAttempt(record.attemptId).executeAsOne().let {
             it.stop_requested == 0L && (jobRow(itemRow(record.itemId).job_id).state != "CANCELLED" || it.state in listOf("PUBLISHING", "PUBLISHED", "SUCCEEDED"))
         })
+    }
+
+    override suspend fun maintenanceView() = read {
+        MaintenanceView(q.allJobs().executeAsList().map { it.record() }, q.allItems().executeAsList().map { it.record() },
+            q.allAttempts().executeAsList().map { it.record() }, commits.listCommits().executeAsList().map { SnapshotJson.decodeFromString<CommitRecord>(it.payload) },
+            maintenance.artifacts().executeAsList().map { SnapshotJson.decodeFromString<ManagedArtifact>(it.payload) })
+    }
+    override suspend fun registerArtifact(artifact: ManagedArtifact): ManagedArtifact = write {
+        val row = maintenance.artifactByPath(artifact.evidence.identity.path.value).executeAsOneOrNull()
+        if (row == null) {
+            maintenance.insertArtifact(artifact.id, artifact.evidence.identity.path.value, SnapshotJson.encodeToString(artifact), artifact.state.name, artifact.revision)
+            artifact
+        } else {
+            val old = SnapshotJson.decodeFromString<ManagedArtifact>(row.payload)
+            check(old.state != ArtifactState.MARKED) { "清理标记中的文件禁止重新认领" }
+            if (old.evidence == artifact.evidence && old.kind == artifact.kind && old.state == ArtifactState.LIVE && old.commitId == artifact.commitId) old
+            else artifact.copy(id = old.id, revision = old.revision + 1).also { updateArtifact(it, old.revision) }
+        }
+    }
+    private fun updateArtifact(artifact: ManagedArtifact, previousRevision: Long) {
+        check(maintenance.updateArtifact(SnapshotJson.encodeToString(artifact), artifact.state.name, artifact.revision, artifact.id, previousRevision).value == 1L) { "产物 revision 已过期" }
+    }
+    override suspend fun savePreview(preview: CleanupPreview): Unit = write { maintenance.insertPreview(preview.id, SnapshotJson.encodeToString(preview)) }
+    override suspend fun preview(id: String) = read { SnapshotJson.decodeFromString<CleanupPreview>(maintenance.findPreview(id).executeAsOne().payload) }
+    override suspend fun claimPreview(id: String, confirmation: String): CleanupPreview = write {
+        val row = maintenance.findPreview(id).executeAsOne()
+        val preview = SnapshotJson.decodeFromString<CleanupPreview>(row.payload)
+        require(row.consumed == 0L && preview.confirmation == confirmation) { "预览已消费或令牌不匹配" }
+        check(maintenance.consumePreview(id).value == 1L)
+        preview.decisions.filter { it.eligible }.forEach {
+            val old = SnapshotJson.decodeFromString<ManagedArtifact>(maintenance.artifactById(it.artifact.id).executeAsOne().payload)
+            check(old == it.artifact && old.state == ArtifactState.LIVE) { "预览后的产物状态发生变化" }
+            updateArtifact(old.copy(state = ArtifactState.MARKED, cleanupId = id, revision = old.revision + 1), old.revision)
+        }
+        preview
+    }
+    override suspend fun completeDeletion(artifactId: String) = write {
+        val old = SnapshotJson.decodeFromString<ManagedArtifact>(maintenance.artifactById(artifactId).executeAsOne().payload)
+        check(old.state == ArtifactState.MARKED && old.cleanupId != null)
+        if (old.kind == ArtifactKind.ORIGINAL_BACKUP) {
+            val parent = SnapshotJson.decodeFromString<CommitRecord>(commits.findCommit(requireNotNull(old.commitId)).executeAsOne().payload)
+            check(parent.phase == CommitPhase.COMMITTED && parent.backup?.sameLocation(old.evidence.identity.path) == true)
+            val released = parent.copy(backupReleased = true, revision = parent.revision + 1)
+            check(commits.updateCommit(released.phase.name, SnapshotJson.encodeToString(released), parent.id, parent.revision).value == 1L)
+            event(parent.plan.let { itemRow(parent.itemId).job_id }, parent.itemId, "OriginalBackupReleased", old.cleanupId, System.currentTimeMillis())
+        }
+        updateArtifact(old.copy(state = ArtifactState.DELETED, revision = old.revision + 1), old.revision)
+    }
+    override suspend fun undoDeletionMark(artifactId: String) = write {
+        val old = SnapshotJson.decodeFromString<ManagedArtifact>(maintenance.artifactById(artifactId).executeAsOne().payload)
+        check(old.state == ArtifactState.MARKED)
+        updateArtifact(old.copy(state = ArtifactState.LIVE, cleanupId = null, revision = old.revision + 1), old.revision)
+    }
+    override suspend fun consumePublishedStaging(commitId: String): Unit = write {
+        val record = SnapshotJson.decodeFromString<CommitRecord>(commits.findCommit(commitId).executeAsOne().payload)
+        check(record.phase == CommitPhase.COMMITTED && record.output?.identity?.fileKey == record.staged.identity.fileKey)
+        val row = maintenance.artifactByPath(record.staged.identity.path.value).executeAsOneOrNull()
+        if (row != null) {
+            val old = SnapshotJson.decodeFromString<ManagedArtifact>(row.payload)
+            check(old.kind == ArtifactKind.STAGING && old.commitId == record.id)
+            if (old.state == ArtifactState.LIVE) updateArtifact(old.copy(state = ArtifactState.DELETED, revision = old.revision + 1), old.revision)
+        }
+    }
+    override suspend fun backupDatabase(path: LocalPath) = read {
+        driver.execute(null, "VACUUM INTO ?", 1) { bindString(0, path.value) }
+        java.nio.channels.FileChannel.open(Path.of(path.value), java.nio.file.StandardOpenOption.WRITE).use { it.force(true) }
     }
 }

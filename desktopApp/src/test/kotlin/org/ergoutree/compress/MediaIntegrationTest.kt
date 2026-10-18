@@ -17,7 +17,7 @@ import org.junit.rules.TemporaryFolder
 import java.nio.file.Files
 import kotlin.test.*
 
-/** Explicit opt-in. All media are synthesized under a TemporaryFolder; no private sample inputs. */
+/** 显式启用真实媒体回归，全部合成素材由临时目录管理，测试结束自动清理。 */
 class MediaIntegrationTest {
     @get:Rule val temporary = TemporaryFolder()
     private fun runner(): ProcessRunner = JvmProcessRunner(if (System.getProperty("os.name").startsWith("Windows")) WindowsProcessLauncher() else PortableProcessLauncher())
@@ -121,14 +121,12 @@ class MediaIntegrationTest {
         val plan = FreezeJob(f.files).execute(name, listOf(PlanningSelection(f.files.identity(f.source), f.media)), f.tools, settings, output).plans.single()
         val before = f.files.evidence(f.source)
         val result = RunCopy(f.files, FfmpegEncoder(f.runner), FullMediaValidator(f.runner, f.probe, f.files), NioCopyArtifacts(f.archive, f.files)).execute(plan, StopSignal())
-        if (result.stage != AttemptStage.SUCCEEDED) {
-            val logs = java.nio.file.Path.of(System.getProperty("ergou.app.home"), "test-output", "s5-failure-$name")
-            Files.createDirectories(logs)
-            Files.walk(f.archive.nio()).use { paths -> paths.filter { Files.isRegularFile(it) && (it.toString().endsWith(".log") || it.toString().endsWith(".argv.json")) }.forEach {
-                Files.copy(it, logs.resolve(it.parent.fileName.toString() + "-" + it.fileName), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
-            } }
+        val diagnostic = if (result.stage == AttemptStage.SUCCEEDED) "" else Files.walk(f.archive.nio()).use { paths ->
+            paths.filter { Files.isRegularFile(it) && it.toString().endsWith(".log") }.limit(4).toList()
+                .joinToString("\n") { Files.readString(it).takeLast(1500) }
         }
-        assertEquals(AttemptStage.SUCCEEDED, result.stage, result.message)
+        // 失败线索进入测试断言，不另复制日志到长期保留的测试目录。
+        assertEquals(AttemptStage.SUCCEEDED, result.stage, result.message + "\n" + diagnostic)
         assertEquals(before, f.files.evidence(f.source))
         return plan to f.probe.inspect(result.destination!!, f.tools, f.root, StopSignal())
     }
@@ -216,9 +214,8 @@ class MediaIntegrationTest {
             metrics += mapOf("class" to kind, "actualBytes" to actual.toString(), "predictedBytes" to predicted.toString(), "relativeError" to relativeError.toString(),
                 "rangeCovered" to (actual in report.estimate.lowerBytes!!..report.estimate.upperBytes!!).toString(), "samplingAndStaticMillis" to elapsedMs.toString(), "sampleMediaSeconds" to "3", "note" to "6 秒合成小视频，封装预算占比高；不是生产误差承诺")
         }
-        val evidence = java.nio.file.Path.of(System.getProperty("ergou.app.home"), "test-output", "s5-analysis-benchmark.json")
-        Files.createDirectories(evidence.parent)
-        Files.writeString(evidence, SnapshotJson.encodeToString(metrics))
+        // 基准属于当轮输出；可将结论写入文档，原始报告随测试结果清理。
+        println("分析基准：" + SnapshotJson.encodeToString(metrics))
     }
     @Test fun fractionalAndVariableFrameTimelinesSurviveWithoutImplicitCfr(): Unit = runBlocking {
         val f = fixture()

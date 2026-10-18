@@ -6,13 +6,15 @@ import kotlinx.serialization.SerializationException
 import kotlinx.serialization.encodeToString
 import org.ergoutree.compress.application.SnapshotJson
 import org.ergoutree.compress.domain.AnalysisReport
-import org.ergoutree.compress.ports.AnalysisCache
+import org.ergoutree.compress.ports.*
+import org.ergoutree.compress.domain.*
+import org.ergoutree.compress.infrastructure.files.local
 import java.nio.channels.FileChannel
 import java.nio.file.*
 import java.util.UUID
 
-/** Disposable derived data, separate from authoritative jobs/validation/commit journals. */
-class JsonAnalysisCache(private val root: Path) : AnalysisCache {
+/** 原子保存可再生分析缓存，与权威任务和提交日志分开管理。 */
+class JsonAnalysisCache(private val root: Path, private val recorder: ArtifactRecorder = NoopArtifactRecorder) : AnalysisCache {
     private fun path(key: String): Path {
         require(key.matches(Regex("[a-f0-9]{64}")))
         return root.resolve("$key.json")
@@ -30,5 +32,6 @@ class JsonAnalysisCache(private val root: Path) : AnalysisCache {
         Files.writeString(temporary, SnapshotJson.encodeToString(report), StandardOpenOption.CREATE_NEW)
         FileChannel.open(temporary, StandardOpenOption.WRITE).use { it.force(true) }
         Files.move(temporary, path(report.cacheKey), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+        recorder.file(path(report.cacheKey).local(), ArtifactKind.CACHE)
     }
 }

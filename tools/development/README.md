@@ -97,10 +97,49 @@ S5 修正了 MKV 毫秒时间基到编码器的精度碰撞：保留 FPS 时明�
 
 改扩展名任务的“恢复原始版本”现在恢复原文件路径和扩展名；通过反向 CHANGE_EXTENSION 事务先独占发布，再把当前压缩版本归档为新备份。原路径已有外部文件会拒绝，旧唯一原始备份不消费。当前逆向恢复支持原扩展名 MP4/MKV；其他原扩展名保留原始备份并明确拒绝此自动恢复入口。与同名恢复一样沿用 journal 和实物对账。
 
-测试记录：S3 52 项、S4 68 项通过。S5 最终阶段门与预测基准详见本地 docs/planning/09-s3-s5-development.md 和 test-output/s5-*。测试覆盖 CPU/NVENC、AAC、Drop 后重映射、字幕字体、章节、缩放/CFR、分数 FPS/VFR、转封装、采样缓存和静态候选。S6 的非 UI 工作（档案清理、空间治理、迁移和脱敏）及 S7 发布矩阵仍待完成；不能把剩余 MVP 简化为只有 UI。
+测试记录：S3 52 项、S4 68 项通过。S5 最终阶段门与预测基准详见本地 docs/planning/09-s3-s5-development.md。测试覆盖 CPU/NVENC、AAC、Drop 后重映射、字幕字体、章节、缩放/CFR、分数 FPS/VFR、转封装、采样缓存和静态候选。S6 非 UI 实现见下节；生产 UI 与 S7 发布矩阵仍待完成。
 
 命令语义参考：[FFmpeg 官方命令文档](https://ffmpeg.org/ffmpeg.html)、[滤镜文档](https://ffmpeg.org/ffmpeg-filters.html)。开发依赖版本沿用已锁定基线，不借本阶段升级依赖。
 
 恢复操作在发布前停止会持久化 CANCELLED 并释放预留，启动不自动发布；发布门开始后完成不可取消的核对。S5 数据根禁止用 S4/更早程序降级打开。
 
-最终 S5 回归 90 项（sharedLogic 54、desktopApp 36），0 失败、0 跳过；自带运行时包的 AAC 任务、持久历史、采样/静态分析及 v2→v3 数据升级冒烟均通过。报告保存在本地 test-output/s5-*。
+最终 S5 回归 90 项（sharedLogic 54、desktopApp 36），0 失败、0 跳过；自带运行时包的 AAC 任务、持久历史、采样/静态分析及 v2→v3 数据升级冒烟均通过。历史原始测试产物按项目清理规范回收，阶段结论保留在 docs。
+
+## S6 档案维护（无生产 UI）
+
+数据库升级为 v4，新增 managed_artifact 与 cleanup_preview；v1/v2/v3 均先一致性备份后迁移，禁止旧程序降级打开。FrozenJob/planner 继续保持 v3 和既有 canonical，不因维护功能修改冻结参数。提交记录新增 backupReleased/backupEvidence，分别表达明确释放备份与迁移后的副本身份。
+
+commonMain 的 ArtifactCleanup、StorageOverview、MaintenanceGate、SpaceAwareExecutor、DiagnosticRedactor 通过端口组合。JVM 负责 SQLite/JSON/文件和迁移，Windows 使用真实句柄删除，不将普通路径删除作为其他平台的默认安全能力。常规执行与分析共享活动门，清理/迁移/导出独占；迁移成功后旧会话封存。
+
+```powershell
+.\gradlew.bat :desktopApp:run --args="--storage"
+.\gradlew.bat :desktopApp:run --args="--retention"
+.\gradlew.bat :desktopApp:run --args="--retention-settings=保留策略.json"
+.\gradlew.bat :desktopApp:run --args="--cleanup-preview --clear-cache --include-candidates"
+.\gradlew.bat :desktopApp:run --args="--cleanup=预览ID --confirm=预览令牌"
+.\gradlew.bat :desktopApp:run --args="--export-support=应用工作根外的新诊断包.zip"
+.\gradlew.bat :desktopApp:run --args="--migrate-data-root=已存在的空目录"
+```
+
+每次只选择一个维护动作，可附加 `--data-root=绝对路径`。选择备份清理须在预览时加 `--include-backups`，执行时再加 `--ack-backup-loss`。预览有效 15 分钟且只能消费一次；执行重新核对引用、保留策略、路径、file ID 和 SHA-256。原始素材、工具、最终输出与审计元数据不可清理，活动/待核对任务、未决提交也会阻止清理。隐藏历史不解除保护。年龄从产物登记起算，不能用旧素材继承的修改时间绕过备份保留期。
+
+默认保留策略：缓存 30 天、详细日志 14 天、缓存预算 512 MiB、原始备份最短 30 天；原始备份默认不删除，到期仍需明确选择。清理先事务标记，再按独占句柄删除并写墓碑；删除完成但落库失败由启动对账补记。离线或根身份改变不等于文件已删除。明确释放备份后仍可核对完成项，但拒绝该版本的恢复。媒体逻辑减少、备份保留和逻辑删除量分别统计，不承诺精确磁盘回收。
+
+编码预算按实际卷合并，候选与 staging 各按源大小的两倍保守预留，每卷安全余量 64 MiB。运行中只监测安全余量；不足时先持久暂停，再停止编码并保留候选。该预算不承诺最终文件硬上限，也不替代运行监控。
+
+数据根迁移要求所有任务终结、提交已核对、目标空且路径安全。复制并校验完整内容、权限、时间与 ADS，保留迁移前一致性数据库副本，重定位内部执行引用和备份身份，冻结源/工具/输出路径不变。根内已登记缓存也迁移；原生库临时解压文件重建。最后原子切换启动指针并要求重启。失败不切换源档案，未完成目标带 pending 标记不能启用；旧根保留回退，跨卷旧登记工作区继续服务原输出卷。此接口不能替代独立离线灾备产品。
+
+诊断 ZIP 仅含计数和有界脱敏日志，匿名条目名，默认移除本地路径、素材名称、邮箱和凭证，不含数据库、素材或版本备份。每文件读取上限 256 KiB，总读取预算 4 MiB，导出目标不能覆盖已存在文件。审计凭据保留，详细日志按策略清理。
+
+## 回归、清理与设计原型
+
+```powershell
+.\verification\verify-backend.ps1
+.\verification\verify-backend.ps1 -Media -Prototype
+```
+
+真实媒体通过 PATH 或 ERGOU_TEST_FFMPEG/ERGOU_TEST_FFPROBE 选择工具；Prototype 临时安装 jsdom 26.1.0，需要 npm 可联网。脚本记录各套件简要结论到本地 docs/report/latest-backend-verification.md，然后清理当轮原始测试报告、编译后的测试类、临时依赖和缓存；系统临时文件集中到独占根，JVM 退出后再清理原生 DLL。合成媒体/SQLite 使用 JUnit TemporaryFolder，跨卷夹具使用 OwnedTestDirectory 并在退出时校验边界清理。失败的必要诊断进入断言，不额外复制长期日志。测试源码和可复用验证工具属于代码，长期保留；用户原片不属于清理目标。
+
+项目中文注释与清理规范见根 AGENTS.md。独立 HTML 设计入口为 design/desktop-prototype/index.html，可直接双击离线打开，使用说明见同目录 README。没有改动生产 sharedUI；DOM 测试不证明浏览器视觉、原生焦点、DPI、万条清单性能或读屏体验通过。生产 UI 和 S7 完整发布验收继续单独推进。
+
+S6 最终回归 112 项（sharedLogic 68、desktopApp 44，其中真实媒体 11），0 失败、0 跳过；HTML DOM 交互另有 6 项通过。自带运行时的空间/清理/诊断/迁移重启冒烟通过。原始输出已清理，简要验收结论保存在本地 docs。

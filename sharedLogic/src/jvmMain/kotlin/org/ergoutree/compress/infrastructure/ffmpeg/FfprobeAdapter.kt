@@ -6,13 +6,16 @@ import org.ergoutree.compress.ports.*
 import java.math.BigDecimal
 import java.math.RoundingMode
 
-class FfprobeAdapter(private val runner: ProcessRunner) : MediaProbe {
+/** 保留有界原始探测结果，并映射为通用媒体快照。 */
+class FfprobeAdapter(private val runner: ProcessRunner, private val recorder: ArtifactRecorder = NoopArtifactRecorder) : MediaProbe {
     override suspend fun inspect(path: LocalPath, tools: Toolchain, work: LocalPath, stop: StopSignal): MediaInfo {
         val result = runner.run(ProcessRequest(listOf(tools.ffprobe.path.value, "-v", "error", "-protocol_whitelist", "file,pipe", "-show_data_hash", "sha256", "-show_format", "-show_streams", "-show_chapters", "-of", "json", path.value), work), stop)
         requireProcess(result, ErrorCode.UNSUPPORTED_MEDIA, "媒体探测失败")
         if (result.stdoutTruncated) throw CompressException(ErrorCode.UNSUPPORTED_MEDIA, "ffprobe 输出超过上限")
         kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-            java.nio.file.Files.writeString(java.nio.file.Path.of(work.value, "probe-${java.util.UUID.randomUUID()}.json"), result.stdout)
+            val rawPath = java.nio.file.Path.of(work.value, "probe-${java.util.UUID.randomUUID()}.json")
+            java.nio.file.Files.writeString(rawPath, result.stdout)
+            recorder.file(LocalPath(rawPath.toString()), ArtifactKind.CACHE)
         }
         return parse(result.stdout)
     }

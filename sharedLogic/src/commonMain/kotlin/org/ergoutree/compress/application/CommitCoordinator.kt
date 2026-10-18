@@ -10,7 +10,7 @@ import kotlinx.coroutines.sync.withLock
 import org.ergoutree.compress.domain.*
 import org.ergoutree.compress.ports.*
 
-/** Database intent precedes every namespace mutation. Native return values are never completion proof. */
+/** 以持久意图和实物证据协调文件提交，原生 API 返回值不作为完成证明。 */
 class CommitCoordinator(private val store: CommitStore, private val jobs: JobStore, private val files: CommitFiles,
     private val environment: PlanEnvironment, private val registry: WorkspaceRegistry, private val clock: Clock, private val ids: IdGenerator,
     private val checkpoint: CommitCheckpoint = CommitCheckpoint { _, _ -> }) : TransactionRecovery {
@@ -80,7 +80,7 @@ class CommitCoordinator(private val store: CommitStore, private val jobs: JobSto
         val target = files.evidence(record.plan.destination)
         val backup = record.backup?.let { files.evidence(it) }
         if (record.phase == CommitPhase.COMMITTED) {
-            if (target != record.output || (record.backup != null && !matches(backup, record.source))) attention(record, "已完成目标/备份发生变化，禁止自动改写")
+            if (target != record.output || (record.backup != null && !record.backupReleased && !matches(backup, record.backupEvidence ?: record.source))) attention(record, "已完成目标/备份发生变化，禁止自动改写")
             val metadata = files.metadata(record.plan.destination)
             if (metadata.daclHash != record.targetMetadata.daclHash || metadata.adsHashes != record.targetMetadata.adsHashes) attention(record, "已完成目标权限/命名流变化，需要人工确认")
             return record
@@ -140,10 +140,10 @@ class CommitCoordinator(private val store: CommitStore, private val jobs: JobSto
     }
     suspend fun restore(id: String, stop: StopSignal = StopSignal()): CommitRecord {
         val original = store.commit(id)
-        require(original.phase == CommitPhase.COMMITTED && original.backup != null) { "没有已核对的原始备份" }
+        require(original.phase == CommitPhase.COMMITTED && original.backup != null && !original.backupReleased) { "没有已核对的原始备份" }
         require(files.evidence(original.plan.destination) == original.output) { "当前版本已变化，不能恢复覆盖" }
         val backup = requireNotNull(files.evidence(original.backup))
-        require(matches(backup, original.source)) { "原始备份已变化" }
+        require(matches(backup, original.backupEvidence ?: original.source)) { "原始备份已变化" }
         val workspace = registry.forVolume(files.volume(original.plan.destination))
         val newId = ids.next(); val dir = files.prepareDirectory(workspace.root, newId)
         val extensionRestore = original.plan.outputMode == OutputMode.CHANGE_EXTENSION
@@ -155,7 +155,7 @@ class CommitCoordinator(private val store: CommitStore, private val jobs: JobSto
             else -> throw CompressException(ErrorCode.UNSUPPORTED_MEDIA, "原扩展名恢复尚未支持")
         } else original.plan.container
         val staged = child(dir, "restore.${restoredContainer.extension}")
-        files.copy(original.backup, staged, stop) // Never consume the only original backup.
+        files.copy(original.backup, staged, stop) // 恢复先复制，绝不消费唯一原始备份。
         files.prepareMetadata(original.backup, staged, original.sourceMetadata)
         val current = requireNotNull(files.evidence(original.plan.destination))
         val plan = original.plan.copy(schemaVersion = maxOf(2, original.plan.schemaVersion), plannerVersion = maxOf(2, original.plan.plannerVersion), source = current.identity, destination = target, container = restoredContainer, outputMode = if (extensionRestore) OutputMode.CHANGE_EXTENSION else OutputMode.REPLACE, onlyIfSmaller = false)

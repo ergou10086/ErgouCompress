@@ -1,0 +1,29 @@
+CREATE TABLE managed_artifact (
+    id TEXT NOT NULL PRIMARY KEY,
+    path TEXT NOT NULL UNIQUE,
+    payload TEXT NOT NULL,
+    state TEXT NOT NULL,
+    revision INTEGER NOT NULL
+);
+CREATE TABLE cleanup_preview (
+    id TEXT NOT NULL PRIMARY KEY,
+    payload TEXT NOT NULL,
+    consumed INTEGER NOT NULL DEFAULT 0
+);
+
+artifacts:
+SELECT * FROM managed_artifact ORDER BY id;
+artifactByPath:
+SELECT * FROM managed_artifact WHERE path = ?;
+artifactById:
+SELECT * FROM managed_artifact WHERE id = ?;
+insertArtifact:
+INSERT INTO managed_artifact(id,path,payload,state,revision) VALUES(?,?,?,?,?);
+updateArtifact:
+UPDATE managed_artifact SET payload = ?, state = ?, revision = ? WHERE id = ? AND revision = ?;
+insertPreview:
+INSERT INTO cleanup_preview(id,payload) VALUES(?,?);
+findPreview:
+SELECT * FROM cleanup_preview WHERE id = ?;
+consumePreview:
+UPDATE cleanup_preview SET consumed = 1 WHERE id = ? AND consumed = 0;

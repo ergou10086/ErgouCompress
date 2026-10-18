@@ -112,3 +112,8 @@ findReservation:
 SELECT item_id FROM reservation WHERE target = ?;
 markSuperseded:
 UPDATE item SET superseded = 1, revision = revision + 1 WHERE id = ?;
+
+allJobs:
+SELECT * FROM job ORDER BY id;
+allAttempts:
+SELECT * FROM attempt ORDER BY item_id, sequence;

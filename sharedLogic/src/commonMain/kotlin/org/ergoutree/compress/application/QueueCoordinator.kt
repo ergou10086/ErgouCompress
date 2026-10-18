@@ -9,29 +9,30 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import org.ergoutree.compress.domain.*
 import org.ergoutree.compress.ports.*
 
-/** The owning desktop session holds the OS file lock throughout recovery and dispatch. */
+/** 协调持久队列、暂停和恢复，所有写操作与存储维护共享活动门。 */
 class QueueCoordinator(private val store: JobStore, private val executor: ItemExecutor, private val files: PlanEnvironment, private val clock: Clock, private val ids: IdGenerator,
-    private val transactions: TransactionRecovery = TransactionRecovery { }) {
+    private val transactions: TransactionRecovery = TransactionRecovery { }, private val activity: MaintenanceGate = MaintenanceGate(), private val beforeRecovery: suspend () -> Unit = {}) {
     private val worker = Mutex()
     private val control = Mutex()
     private var active: Pair<ClaimedItem, StopSignal>? = null
     private val recovered = MutableStateFlow(false)
-    suspend fun submit(job: FrozenJob) = store.enqueue(job, clock.nowMillis())
+    suspend fun submit(job: FrozenJob) = activity.work { store.enqueue(job, clock.nowMillis()) }
     suspend fun history() = store.history()
     suspend fun items(jobId: String) = store.items(jobId)
     suspend fun attempts(itemId: String) = store.attempts(itemId)
     suspend fun events(jobId: String) = store.events(jobId)
-    suspend fun retry(itemId: String) = store.retry(itemId, clock.nowMillis())
-    suspend fun hide(jobId: String) = store.hide(jobId)
-    suspend fun pause(jobId: String, immediate: Boolean = false) {
-        store.requestPause(jobId, immediate, clock.nowMillis()) // Durable before q.
+    suspend fun retry(itemId: String) = activity.work { store.retry(itemId, clock.nowMillis()) }
+    suspend fun hide(jobId: String) = activity.work { store.hide(jobId) }
+    suspend fun pause(jobId: String, immediate: Boolean = false) = activity.work {
+        store.requestPause(jobId, immediate, clock.nowMillis()) // 先持久化暂停意图，再发送停止信号。
         if (immediate) control.withLock { active?.takeIf { it.first.item.jobId == jobId }?.second }?.request()
     }
-    suspend fun cancel(jobId: String) {
+    suspend fun cancel(jobId: String) = activity.work {
         store.cancel(jobId, clock.nowMillis())
         control.withLock { active?.takeIf { it.first.item.jobId == jobId }?.second }?.request()
     }
-    suspend fun recover() = worker.withLock {
+    suspend fun recover() { beforeRecovery(); activity.work { recoverOwned() } }
+    private suspend fun recoverOwned() = worker.withLock {
         recovered.value = false
         check(active == null)
         transactions.recoverTransactions()
@@ -54,9 +55,10 @@ class QueueCoordinator(private val store: JobStore, private val executor: ItemEx
         }
         recovered.value = true
     }
-    suspend fun run(jobId: String, emit: (AttemptEvent) -> Unit = {}): List<AttemptResult> {
+    suspend fun run(jobId: String, emit: (AttemptEvent) -> Unit = {}): List<AttemptResult> = activity.work { runOwned(jobId, emit) }
+    private suspend fun runOwned(jobId: String, emit: (AttemptEvent) -> Unit): List<AttemptResult> {
         check(recovered.value) { "必须先完成启动对账" }
-        if (!worker.tryLock()) return emptyList() // Repeated resume never starts a second worker.
+        if (!worker.tryLock()) return emptyList() // 重复继续请求不能启动第二个派发器。
         try {
             store.resume(jobId, clock.nowMillis())
             val results = mutableListOf<AttemptResult>()
@@ -67,6 +69,7 @@ class QueueCoordinator(private val store: JobStore, private val executor: ItemEx
                 if (store.attempts(claim.item.id).last().stopRequested) stop.request()
                 val lifecycle = object : AttemptLifecycle {
                     override val claim = claim
+                    override suspend fun resourcePause(reason: String) = store.requestPause(claim.item.jobId, true, clock.nowMillis())
                     override suspend fun created(work: AttemptWorkspace, source: ContentEvidence, planHash: String) = store.workspace(claim, WorkspaceRecord(work.id, work.root, work.candidate, source, planHash), clock.nowMillis())
                     override suspend fun validated(receipt: ValidationReceipt) = store.validated(claim, receipt, clock.nowMillis())
                     override suspend fun publishing(prepared: PreparedCopy) = store.publishing(claim, clock.nowMillis())

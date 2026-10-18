@@ -15,6 +15,7 @@ import java.nio.file.Path
 import java.sql.DriverManager
 import kotlin.test.*
 
+/** 使用独占字节夹具验证原生提交与故障边界，跨卷产物在测试退出时清理。 */
 class CommitTransactionTest {
     @get:Rule val temporary = TemporaryFolder()
     @Before fun windowsOnly() = Assume.assumeTrue(System.getProperty("os.name").startsWith("Windows"))
@@ -157,9 +158,8 @@ class CommitTransactionTest {
         }
     }
     @Test fun crossVolumeRequiresRegisteredWorkspaceAndStagesBeforeReplacing(): Unit = runBlocking {
-        fixture().use { f ->
-            val workspaceRoot = Path.of(System.getProperty("ergou.app.home"), "test-output", "s4-cross-volume", java.util.UUID.randomUUID().toString())
-            Files.createDirectories(workspaceRoot)
+        OwnedTestDirectory("s4-cross-volume").use { owned -> fixture().use { f ->
+            val workspaceRoot = owned.path
             Assume.assumeTrue(f.native.volume(workspaceRoot.local()).id != f.native.volume(f.data.local()).id)
             val input = f.input(sourceDirectory = workspaceRoot.resolve("inputs")); val coordinator = f.coordinator()
             assertFailsWith<CompressException> { coordinator.prepare(input.claim, input.plan, input.receipt, StopSignal()) }
@@ -168,7 +168,7 @@ class CommitTransactionTest {
             assertTrue(record.staged.identity.path.nio().startsWith(registered))
             f.publish(coordinator, record, input.claim)
             assertEquals(input.receipt.source.sha256, f.environment.evidence(record.backup!!).sha256)
-        }
+        } }
     }
     @Test fun databaseOrMirrorWriteFailurePreventsNativeMutation(): Unit = runBlocking {
         fixture().use { f ->

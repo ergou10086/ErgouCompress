@@ -7,7 +7,7 @@ import kotlinx.serialization.encodeToString
 import org.ergoutree.compress.domain.*
 import org.ergoutree.compress.ports.*
 
-/** S2 is deliberately a single-file use case. Persistent claiming and resume belong to S3. */
+/** 执行单文件编码、完整验证和受控发布，持久调度由队列用例负责。 */
 class RunCopy(
     private val environment: PlanEnvironment,
     private val encoder: EncoderAdapter,
@@ -56,11 +56,14 @@ class RunCopy(
             val stage = when (code) { ErrorCode.USER_INTERRUPTED -> AttemptStage.INTERRUPTED; ErrorCode.NO_BENEFIT -> AttemptStage.SKIPPED; else -> AttemptStage.FAILED }
             val message = "${failure.message ?: code.name}${work?.let { "；候选与诊断保留于 ${it.root.value}" } ?: ""}"
             work?.let { current ->
-                // Recording failure is best effort; never conceals the original error.
+                // 诊断落盘尽力而为，不覆盖最初的执行错误。
                 try { artifacts.record(current, "failure.json", SnapshotJson.encodeToString(mapOf("code" to code.name, "message" to message))) } catch (_: Exception) { }
             }
             emit(AttemptEvent(stage, message))
             return AttemptResult(stage, error = code, message = message)
+        } finally {
+            // 即使协程取消，也登记当前执行实际产生的文件，便于后续安全预览。
+            work?.let { withContext(NonCancellable) { artifacts.capture(it) } }
         }
     }
 }
