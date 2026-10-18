@@ -14,7 +14,7 @@ class RunCopy(
     private val validator: CandidateValidator,
     private val artifacts: CopyArtifacts,
 ) {
-    suspend fun execute(plan: ResolvedPlan, stop: StopSignal, emit: (AttemptEvent) -> Unit = {}): AttemptResult {
+    suspend fun execute(plan: ResolvedPlan, stop: StopSignal, lifecycle: AttemptLifecycle = NoopAttemptLifecycle, emit: (AttemptEvent) -> Unit = {}): AttemptResult {
         var work: AttemptWorkspace? = null
         try {
             emit(AttemptEvent(AttemptStage.PREPARING, "核对工具、源文件与工作空间"))
@@ -26,18 +26,23 @@ class RunCopy(
             }
             val source = environment.evidence(plan.source.path)
             work = artifacts.create(plan, hash)
+            lifecycle.created(work, source, hash)
             emit(AttemptEvent(AttemptStage.ENCODING, "编码到独立候选，不修改源文件"))
             encoder.encode(plan, work.candidate, work.root, stop) { emit(AttemptEvent(AttemptStage.ENCODING, "编码中", it)) }
             stop.checkRunning()
             emit(AttemptEvent(AttemptStage.VALIDATING, "完整解码、流与音频包校验"))
             val receipt = validator.validate(plan, hash, source, work.candidate, work.root, stop)
             artifacts.record(work, "validation.json", SnapshotJson.encodeToString(receipt))
+            lifecycle.validated(receipt)
             stop.checkRunning()
             emit(AttemptEvent(AttemptStage.PUBLISHING, "准备目标卷副本，可停止；最终发布后核对 SHA-256"))
             val prepared = artifacts.preparePublication(plan, receipt, work, stop)
             stop.checkRunning()
             val destination = withContext(NonCancellable) {
-                stop.publish { artifacts.publish(prepared) }
+                stop.publish {
+                    lifecycle.publishing(prepared)
+                    artifacts.publish(prepared).also { lifecycle.published(environment.evidence(it)) }
+                }
             }
             val result = AttemptResult(AttemptStage.SUCCEEDED, destination, message = "副本已发布，源文件保留；档案：${work.root.value}")
             emit(AttemptEvent(result.stage, result.message))

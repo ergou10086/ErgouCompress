@@ -89,8 +89,11 @@ class MediaIntegrationTest {
             assertTrue(complete); assertTrue(entries.single().eligible)
             val selected = entries.single()
             val job = app.freeze(listOf(PlanningSelection(selected.file, selected.media!!)), tools, EncodeSettings(), output.toString())
-            val result = app.run(job.plans.single(), StopSignal()) {}
+            app.queue.submit(job)
+            app.queue.recover()
+            val result = app.queue.run(job.id).single()
             assertEquals(AttemptStage.SUCCEEDED, result.stage, result.message)
+            assertEquals(JobState.COMPLETED, app.queue.history().single().state)
             assertTrue(Files.exists(f.archive.nio().resolve("config/tools.json")))
         }
     }

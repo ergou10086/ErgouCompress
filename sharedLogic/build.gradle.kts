@@ -1,6 +1,7 @@
 plugins {
     alias(libs.plugins.kotlinMultiplatform)
     alias(libs.plugins.kotlinSerialization)
+    alias(libs.plugins.sqldelight)
 }
 
 kotlin {
@@ -17,8 +18,14 @@ kotlin {
             implementation(libs.kotlin.test)
             implementation(libs.kotlinx.coroutines.test)
         }
+        jvmMain.dependencies {
+            implementation(libs.sqldelight.sqlite.driver)
+            implementation(libs.sqlite.jdbc)
+        }
     }
 }
+
+sqldelight { databases { create("CatalogDatabase") { packageName.set("org.ergoutree.compress.catalog") } } }
 
 // Hardware/media tests are explicit so the ordinary suite remains deterministic.
 tasks.withType<Test>().configureEach {

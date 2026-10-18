@@ -11,7 +11,12 @@ import java.util.UUID
 data class DataLocation(val root: Path, val notice: String?)
 
 class DesktopSession(val location: DataLocation, private val channel: FileChannel, private val lock: FileLock) : AutoCloseable {
-    override fun close() { lock.release(); channel.close() }
+    private val resources = mutableListOf<AutoCloseable>()
+    fun <T : AutoCloseable> own(resource: T): T = resource.also { resources += it }
+    override fun close() {
+        try { resources.asReversed().forEach { it.close() } }
+        finally { try { lock.release() } finally { channel.close() } }
+    }
 }
 
 object DesktopBootstrap {

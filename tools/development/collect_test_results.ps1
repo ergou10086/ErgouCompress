@@ -1,6 +1,7 @@
 param(
     [string]$Name = 's0-s2',
-    [int]$ExpectedTests = 0
+    [int]$ExpectedTests = 0,
+    [string[]]$Modules = @('sharedLogic', 'sharedUI', 'desktopApp')
 )
 
 $ErrorActionPreference = 'Stop'
@@ -12,6 +13,7 @@ New-Item -ItemType Directory -Force -Path $evidenceRoot | Out-Null
 $resultRoots = @('sharedLogic/build/test-results/jvmTest', 'sharedUI/build/test-results/jvmTest', 'desktopApp/build/test-results/test')
 $suites = @(foreach ($relativeRoot in $resultRoots) {
     $moduleName = $relativeRoot.Split('/')[0]
+    if ($moduleName -notin $Modules) { continue }
     Get-ChildItem -LiteralPath (Join-Path $projectRoot $relativeRoot) -Filter 'TEST-*.xml' | ForEach-Object {
         $suiteXml = [xml](Get-Content -LiteralPath $_.FullName -Raw)
         $suite = $suiteXml.testsuite

@@ -10,6 +10,7 @@ import org.ergoutree.compress.domain.*
 import org.ergoutree.compress.infrastructure.ffmpeg.*
 import org.ergoutree.compress.infrastructure.files.*
 import org.ergoutree.compress.infrastructure.process.*
+import org.ergoutree.compress.infrastructure.storage.SqlDelightJobStore
 import org.ergoutree.compress.platform.windows.WindowsProcessLauncher
 import org.ergoutree.compress.platform.windows.WindowsFileIdentity
 import org.ergoutree.compress.ports.*
@@ -37,6 +38,9 @@ class AppWiring(private val session: DesktopSession) : DesktopWorkflow {
     private val freezer = FreezeJob(files)
     private val artifacts = NioCopyArtifacts(session.location.root.local(), files)
     private val copies = RunCopy(files, FfmpegEncoder(runner), FullMediaValidator(runner, probe, files), artifacts)
+    private val catalog = session.own(SqlDelightJobStore(session.location.root.resolve("catalog/catalog.sqlite")))
+    val queue = QueueCoordinator(catalog, ItemExecutor { plan, stop, lifecycle, emit -> copies.execute(plan, stop, lifecycle, emit) }, files,
+        Clock { System.currentTimeMillis() }, IdGenerator { UUID.randomUUID().toString() })
     private val config = session.location.root.resolve("config/tools.json")
     override val savedTools: SavedToolPaths = if (Files.exists(config)) {
         // Bad config is visible at startup, not silently replaced with an empty history.
@@ -72,5 +76,5 @@ class AppWiring(private val session: DesktopSession) : DesktopWorkflow {
         }
         return job
     }
-    override suspend fun run(plan: ResolvedPlan, stop: StopSignal, emit: (AttemptEvent) -> Unit): AttemptResult = copies.execute(plan, stop, emit)
+    override suspend fun run(plan: ResolvedPlan, stop: StopSignal, emit: (AttemptEvent) -> Unit): AttemptResult = copies.execute(plan, stop, emit = emit)
 }

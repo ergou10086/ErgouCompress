@@ -1,4 +1,5 @@
 plugins {
+    alias(libs.plugins.sqldelight) apply false
     alias(libs.plugins.kotlinSerialization) apply false
     // this is necessary to avoid the plugins to be loaded multiple times
     // in each subproject's classloader

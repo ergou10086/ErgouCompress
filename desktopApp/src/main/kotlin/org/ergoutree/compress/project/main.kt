@@ -16,12 +16,17 @@ fun main(args: Array<String>) {
     if (System.getProperty("os.name").startsWith("Windows")) System.setProperty("javax.accessibility.assistive_technologies", "com.sun.java.accessibility.AccessBridge")
     val session = try { DesktopBootstrap.open(args.firstOrNull { it.startsWith("--data-root=") }?.substringAfter('='), "--strict-portable" in args) }
     catch (e: Exception) {
-        if ("--diagnostics" in args) { System.err.println(e.message); kotlin.system.exitProcess(1) }
+        if ("--diagnostics" in args || BackendCommandLine.accepts(args)) { System.err.println(e.message); kotlin.system.exitProcess(1) }
         JOptionPane.showMessageDialog(null, e.message, "ErgouCompress 启动失败", JOptionPane.ERROR_MESSAGE); return
     }
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     try {
         val wiring = AppWiring(session)
+        if (BackendCommandLine.accepts(args)) {
+            try { BackendCommandLine.execute(args, wiring) }
+            catch (e: Exception) { System.err.println(e.message); throw e }
+            return
+        }
         if ("--diagnostics" in args) {
             val report = SnapshotJson.encodeToString(mapOf("javaVersion" to System.getProperty("java.version"), "dataRoot" to wiring.dataRoot,
                 "notice" to wiring.startupNotice.orEmpty(), "startupProbe" to "passed"))
