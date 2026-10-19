@@ -27,6 +27,7 @@ kotlin {
         jvmTest.dependencies {
             implementation("org.jetbrains.compose.ui:ui-test:1.12.1")
             implementation(compose.desktop.currentOs)
+            implementation(libs.kotlinx.coroutinesSwing)
         }
     }
 }

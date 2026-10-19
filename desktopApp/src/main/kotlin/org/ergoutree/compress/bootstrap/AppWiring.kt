@@ -23,7 +23,7 @@ import java.nio.file.*
 import java.util.UUID
 
 /** 桌面组合根只装配端口与平台实现，业务决策保持在共享用例中。 */
-class AppWiring(private val session: DesktopSession) : DesktopWorkflow {
+class AppWiring(private val session: DesktopSession) : DesktopWorkspaceWorkflow {
     override val dataRoot = session.location.root.toString()
     override val startupNotice = session.location.notice
     private val windows = System.getProperty("os.name").startsWith("Windows")
@@ -38,7 +38,9 @@ class AppWiring(private val session: DesktopSession) : DesktopWorkflow {
         if (windows) Kernel32.INSTANCE.GetFileAttributes(WindowsFileIdentity.extendedPath(path)).let { it != -1 && it and 0x400 != 0 } else Files.isSymbolicLink(path)
     }
     private val artifactIndex = ManagedArtifactIndex(session.location.root.local(), rootId, catalog, catalog, files, paths)
-    private val runner = JvmProcessRunner(if (windows) WindowsProcessLauncher() else PortableProcessLauncher())
+    private val preferences = JsonDesktopPreferences(session.location.root.resolve("config/preferences.json"))
+    private val runner = PreferenceProcessRunner(JvmProcessRunner(if (windows) WindowsProcessLauncher() else PortableProcessLauncher()), preferences::current)
+    private val taskLogs = TaskLogReader(catalog, paths)
     private val probe = FfprobeAdapter(runner, artifactIndex)
     private val scanner = NioScanner(fileKey) { path ->
         if (windows) {
@@ -63,13 +65,13 @@ class AppWiring(private val session: DesktopSession) : DesktopWorkflow {
     private val storage = StorageOverview(catalog, managedFiles, session.location.root.local())
     private val support = SupportExporter(catalog, managedFiles, activity)
     private val admission = VolumeSpaceAdmission(managedFiles, session.location.root.local())
-    val queue = QueueCoordinator(catalog, SpaceAwareExecutor(ItemExecutor { plan, stop, lifecycle, emit ->
+    override val queue = QueueCoordinator(catalog, SpaceAwareExecutor(ItemExecutor { plan, stop, lifecycle, emit ->
         val publisher = commitTransactions?.let { JournaledArtifacts(artifacts, it, requireNotNull(lifecycle.claim)) } ?: artifacts
         RunCopy(files, FfmpegEncoder(runner), FullMediaValidator(runner, probe, files), publisher).execute(plan, stop, lifecycle, emit)
     }, admission), files, Clock { System.currentTimeMillis() }, IdGenerator { UUID.randomUUID().toString() }, commitTransactions ?: TransactionRecovery { }, activity, beforeRecovery = { cleanup.reconcile() })
     private val analysis = AnalyzeMedia(files, FfmpegMediaSampler(runner, probe, session.location.root.resolve("analysis/artifacts").local(), artifactIndex), JsonAnalysisCache(session.location.root.resolve("analysis/cache"), artifactIndex))
-    suspend fun analyze(plan: ResolvedPlan, options: AnalysisOptions = AnalysisOptions(), stop: StopSignal = StopSignal()) = activity.work { analysis.execute(plan, options, stop) }
-    suspend fun commitHistory() = catalog.commits()
+    override suspend fun analyze(plan: ResolvedPlan, options: AnalysisOptions, stop: StopSignal) = activity.work { analysis.execute(plan, options, stop) }
+    override suspend fun commitHistory() = catalog.commits()
     suspend fun prepareRequest(request: ProcessingRequest): FrozenJob = activity.work {
         val tools = validateTools(request.ffmpeg.ifBlank { savedTools.ffmpeg }, request.ffprobe.ifBlank { savedTools.ffprobe }, StopSignal())
         val found = mutableListOf<ScannedMedia>(); var complete = false
@@ -139,17 +141,44 @@ class AppWiring(private val session: DesktopSession) : DesktopWorkflow {
     }
     override suspend fun run(plan: ResolvedPlan, stop: StopSignal, emit: (AttemptEvent) -> Unit): AttemptResult = activity.work { copies.execute(plan, stop, emit = emit) }
 
-    suspend fun loadRetention() = activity.work { retention.load() }
-    suspend fun saveRetention(policy: RetentionPolicy) = activity.work { retention.save(policy) }
-    suspend fun registerWorkspace(root: LocalPath) = activity.work { requireNotNull(workspaceRegistry).register(root) }
-    suspend fun restoreCommit(id: String) = activity.work { requireNotNull(commitTransactions).restore(id) }
-    suspend fun storageReport(): StorageReport = activity.work { indexLegacyArtifacts(); storage.report() }
-    suspend fun cleanupPreview(options: CleanupOptions = CleanupOptions()): CleanupPreview { activity.work { indexLegacyArtifacts() }; return cleanup.preview(options) }
-    suspend fun cleanupExecute(id: String, confirmation: String, acknowledgeBackupLoss: Boolean = false) = cleanup.execute(id, confirmation, acknowledgeBackupLoss)
-    suspend fun exportSupport(destination: LocalPath) = support.export(destination)
-    suspend fun migrateDataRoot(destination: LocalPath, stop: StopSignal = StopSignal()): MigrationResult {
+    override suspend fun loadRetention() = activity.work { retention.load() }
+    override suspend fun saveRetention(policy: RetentionPolicy) = activity.work { retention.save(policy) }
+    override suspend fun registerWorkspace(root: LocalPath) = activity.work { requireNotNull(workspaceRegistry).register(root) }
+    override suspend fun restoreCommit(id: String) = activity.work { requireNotNull(commitTransactions).restore(id) }
+    override suspend fun storageReport(): StorageReport = activity.work { indexLegacyArtifacts(); storage.report() }
+    override suspend fun cleanupPreview(options: CleanupOptions): CleanupPreview { activity.work { indexLegacyArtifacts() }; return cleanup.preview(options) }
+    override suspend fun cleanupExecute(id: String, confirmation: String, acknowledgeBackupLoss: Boolean) = cleanup.execute(id, confirmation, acknowledgeBackupLoss)
+    override suspend fun exportSupport(destination: LocalPath) = support.export(destination)
+    override suspend fun migrateDataRoot(destination: LocalPath, stop: StopSignal): MigrationResult {
         activity.work { indexLegacyArtifacts() }
         return DataRootMigration(session.location.root.local(), rootId, catalog, catalog, files, requireNotNull(commitFiles), paths, activity).migrate(destination, stop)
+    }
+    override suspend fun estimateSelection(selection: PlanningSelection, tools: Toolchain, settings: EncodeSettings,
+        options: AnalysisOptions, stop: StopSignal): AnalysisReport = activity.work {
+        // 采样只生成独立分析产物，不提交任务，也不使用源路径作为可执行输出。
+        val plan = freezer.execute(UUID.randomUUID().toString(), listOf(selection), tools, settings, session.location.root.local()).plans.single()
+        analysis.execute(plan, options, stop)
+    }
+    override suspend fun loadPreferences() = activity.work { preferences.current() }
+    override suspend fun savePreferences(preferences: DesktopPreferences) = activity.work { this.preferences.save(preferences) }
+    override suspend fun readTaskLogs(jobId: String, cursor: TaskLogCursor?) = activity.work { taskLogs.read(jobId, cursor) }
+    override suspend fun freezeTask(selection: List<PlanningSelection>, tools: Toolchain, settings: EncodeSettings,
+        output: String, mode: OutputMode, onlyIfSmaller: Boolean, audit: TaskImportAudit): FrozenJob = activity.work {
+        val directory = if (mode == OutputMode.COPY) Path.of(output).local() else session.location.root.local()
+        val job = freezer.execute(UUID.randomUUID().toString(), selection, tools, settings, directory, mode, onlyIfSmaller)
+        for (plan in job.plans) if (mode != OutputMode.COPY) {
+            requireNotNull(workspaceRegistry).forVolume(requireNotNull(commitFiles).volume(plan.source.path))
+        }
+        withContext(Dispatchers.IO) {
+            val folder = Files.createDirectories(session.location.root.resolve("jobs/frozen"))
+            for ((name, content) in listOf("${job.id}.json" to SnapshotJson.encodeToString(job), "${job.id}-imports.json" to SnapshotJson.encodeToString(audit))) {
+                val file = folder.resolve(name)
+                Files.writeString(file, content, StandardOpenOption.CREATE_NEW)
+                java.nio.channels.FileChannel.open(file, StandardOpenOption.WRITE).use { it.force(true) }
+                artifactIndex.file(file.local(), ArtifactKind.METADATA)
+            }
+        }
+        job
     }
     private suspend fun indexLegacyArtifacts() {
         val view = catalog.maintenanceView()

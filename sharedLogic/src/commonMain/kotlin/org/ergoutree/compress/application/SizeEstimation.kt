@@ -2,6 +2,7 @@ package org.ergoutree.compress.application
 
 import org.ergoutree.compress.domain.*
 
+/** 依据明确码率或采样给出体积范围，未知条件不生成伪精确数值。 */
 object SizeEstimation {
     fun schedule(durationUs: Long, budget: SampleBudget): List<SampleWindow> {
         require(durationUs > 0)
@@ -18,15 +19,19 @@ object SizeEstimation {
         return sum
     }
     fun estimate(plan: ResolvedPlan, samples: List<VideoSample> = emptyList()): SizeEstimate {
-        val mapping = MediaStrategy.resolve(plan.media, plan.settings, plan.container)
-        val duration = plan.media.durationUs ?: return unknown("缺少时长")
+        return estimate(plan.media, plan.settings, plan.container, samples)
+    }
+    /** 草稿预览直接使用媒体与参数，不能构造一个可能被误执行的虚拟输出计划。 */
+    fun estimate(media: MediaInfo, settings: EncodeSettings, container: Container, samples: List<VideoSample> = emptyList()): SizeEstimate {
+        val mapping = MediaStrategy.resolve(media, settings, container)
+        val duration = media.durationUs ?: return unknown("缺少时长")
         if (mapping.any { it.source.kind !in setOf(StreamKind.VIDEO, StreamKind.AUDIO) }) return unknown("字幕/附件体积未建模；不能隐藏这部分大小")
         val audio = audioBitrate(mapping) ?: return unknown("复制音频码率未知；不会将源总码率作为视频再重复加音频")
         val video = mapping.single { it.source.kind == StreamKind.VIDEO }
         val rates = when {
             samples.isNotEmpty() -> samples.map { it.bitrateBps }
             video.action == StreamAction.COPY -> listOf(video.source.bitrateBps?.toDouble() ?: return unknown("复制视频码率未知"))
-            plan.settings.rateControl == RateControl.BITRATE -> listOf(plan.settings.videoBitrateKbps!! * 1000.0)
+            settings.rateControl == RateControl.BITRATE -> listOf(settings.videoBitrateKbps!! * 1000.0)
             else -> return unknown("固定质量没有确定体积函数；可选择多段视频采样")
         }
         fun bytes(rate: Double, overhead: Double = 65_536.0) = bounded((rate + audio) * duration / 8_000_000.0 * 1.03 + overhead)

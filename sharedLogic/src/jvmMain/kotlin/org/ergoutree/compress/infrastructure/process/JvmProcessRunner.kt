@@ -37,6 +37,7 @@ class PortableProcessLauncher : ProcessLauncher {
     }
 }
 
+/** 并发排空子进程管道并记录有界诊断，活动日志定期刷新供桌面增量读取。 */
 class JvmProcessRunner(private val launcher: ProcessLauncher = PortableProcessLauncher()) : ProcessRunner {
     override suspend fun run(request: ProcessRequest, stop: StopSignal, onStdout: (String) -> Unit): ProcessResult = withContext(Dispatchers.IO) {
         require(request.argv.isNotEmpty() && request.timeoutMillis > 0 && request.captureLimit >= 0)
@@ -88,6 +89,7 @@ class JvmProcessRunner(private val launcher: ProcessLauncher = PortableProcessLa
         val captured = StringBuilder()
         var truncated = false
         var logged = 0L
+        var flushedAt = System.nanoTime()
         val writer = log?.let { Files.newBufferedWriter(java.nio.file.Path.of(it)) }
         try {
             val line = StringBuilder()
@@ -103,6 +105,8 @@ class JvmProcessRunner(private val launcher: ProcessLauncher = PortableProcessLa
                     } else if (captured.length < limit) captured.append((text + "\n").take(limit - captured.length))
                     // Cap disk diagnostics per process. Draining continues beyond the cap.
                     if (logged < 16L * 1024 * 1024) { writer?.append(text)?.append('\n'); logged += text.length + 1 }
+                    // 定期刷新活动日志，使独立日志窗口无需等待编码结束。
+                    if (System.nanoTime() - flushedAt >= 200_000_000L) { writer?.flush(); flushedAt = System.nanoTime() }
                     line.clear()
                 }
                 while (true) {

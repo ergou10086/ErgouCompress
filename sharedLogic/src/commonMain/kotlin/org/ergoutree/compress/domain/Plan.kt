@@ -98,7 +98,8 @@ data class Progress(val outTimeUs: Long?, val totalBytes: Long?, val speed: Doub
         if (outTimeUs != null && durationUs != null && durationUs > 0) (outTimeUs.toDouble() / durationUs).coerceIn(0.0, 1.0) else null
 }
 
-data class AttemptEvent(val stage: AttemptStage, val message: String, val progress: Progress? = null, val sizeEstimate: SizeEstimate? = null)
+/** 执行事件绑定当前源文件，批量任务窗口据此匹配时长和显示真实进度。 */
+data class AttemptEvent(val stage: AttemptStage, val message: String, val progress: Progress? = null, val sizeEstimate: SizeEstimate? = null, val source: LocalPath? = null)
 data class AttemptResult(val stage: AttemptStage, val destination: LocalPath? = null, val error: ErrorCode? = null, val message: String)
 
 object MediaPolicy {

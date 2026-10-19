@@ -11,27 +11,28 @@ import org.ergoutree.compress.ports.*
 
 /** 协调持久队列、暂停和恢复，所有写操作与存储维护共享活动门。 */
 class QueueCoordinator(private val store: JobStore, private val executor: ItemExecutor, private val files: PlanEnvironment, private val clock: Clock, private val ids: IdGenerator,
-    private val transactions: TransactionRecovery = TransactionRecovery { }, private val activity: MaintenanceGate = MaintenanceGate(), private val beforeRecovery: suspend () -> Unit = {}) {
+    private val transactions: TransactionRecovery = TransactionRecovery { }, private val activity: MaintenanceGate = MaintenanceGate(), private val beforeRecovery: suspend () -> Unit = {}) : DesktopTaskQueue {
     private val worker = Mutex()
     private val control = Mutex()
     private var active: Pair<ClaimedItem, StopSignal>? = null
     private val recovered = MutableStateFlow(false)
-    suspend fun submit(job: FrozenJob) = activity.work { store.enqueue(job, clock.nowMillis()) }
-    suspend fun history() = store.history()
-    suspend fun items(jobId: String) = store.items(jobId)
-    suspend fun attempts(itemId: String) = store.attempts(itemId)
-    suspend fun events(jobId: String) = store.events(jobId)
-    suspend fun retry(itemId: String) = activity.work { store.retry(itemId, clock.nowMillis()) }
-    suspend fun hide(jobId: String) = activity.work { store.hide(jobId) }
-    suspend fun pause(jobId: String, immediate: Boolean = false) = activity.work {
+    override suspend fun submit(job: FrozenJob) = activity.work { store.enqueue(job, clock.nowMillis()) }
+    override suspend fun history() = store.history()
+    override suspend fun items(jobId: String) = store.items(jobId)
+    override suspend fun attempts(itemId: String) = store.attempts(itemId)
+    override suspend fun events(jobId: String) = store.events(jobId)
+    override suspend fun retry(itemId: String) = activity.work { store.retry(itemId, clock.nowMillis()) }
+    override suspend fun hide(jobId: String) = activity.work { store.hide(jobId) }
+    override suspend fun pause(jobId: String, immediate: Boolean) = activity.work {
         store.requestPause(jobId, immediate, clock.nowMillis()) // 先持久化暂停意图，再发送停止信号。
         if (immediate) control.withLock { active?.takeIf { it.first.item.jobId == jobId }?.second }?.request()
     }
-    suspend fun cancel(jobId: String) = activity.work {
+    override suspend fun cancel(jobId: String) = activity.work {
         store.cancel(jobId, clock.nowMillis())
         control.withLock { active?.takeIf { it.first.item.jobId == jobId }?.second }?.request()
+        Unit
     }
-    suspend fun recover() { beforeRecovery(); activity.work { recoverOwned() } }
+    override suspend fun recover() { beforeRecovery(); activity.work { recoverOwned() } }
     private suspend fun recoverOwned() = worker.withLock {
         recovered.value = false
         check(active == null)
@@ -55,7 +56,7 @@ class QueueCoordinator(private val store: JobStore, private val executor: ItemEx
         }
         recovered.value = true
     }
-    suspend fun run(jobId: String, emit: (AttemptEvent) -> Unit = {}): List<AttemptResult> = activity.work { runOwned(jobId, emit) }
+    override suspend fun run(jobId: String, emit: (AttemptEvent) -> Unit): List<AttemptResult> = activity.work { runOwned(jobId, emit) }
     private suspend fun runOwned(jobId: String, emit: (AttemptEvent) -> Unit): List<AttemptResult> {
         check(recovered.value) { "必须先完成启动对账" }
         if (!worker.tryLock()) return emptyList() // 重复继续请求不能启动第二个派发器。
@@ -76,7 +77,7 @@ class QueueCoordinator(private val store: JobStore, private val executor: ItemEx
                     override suspend fun published(output: ContentEvidence) = store.published(claim, output, clock.nowMillis())
                 }
                 try {
-                    val result = executor.execute(claim.item.plan, stop, lifecycle, emit)
+                    val result = executor.execute(claim.item.plan, stop, lifecycle) { emit(it.copy(source = claim.item.plan.source.path)) }
                     withContext(NonCancellable) { store.finish(claim, result, clock.nowMillis()) }
                     results += result
                 } catch (cancelled: CancellationException) {
