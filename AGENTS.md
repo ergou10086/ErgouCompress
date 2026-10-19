@@ -2,7 +2,7 @@
 
 ## 测试与清理
 
-- 优先使用 `verification/verify-backend.ps1`（真实媒体加 `-Media`，原型交互加 `-Prototype`）统一回归、记录简要结论并清理。
+- 优先使用 `sharedLogic/src/commonTest/resources/development-scripts/verification/verify-backend.ps1`（真实媒体加 `-Media`，原型交互加 `-Prototype`）统一回归、记录简要结论并清理。
 - 每轮测试结束后清理当轮临时脚本、合成媒体、数据库、日志、缓存、截图和测试输出；失败时先定位问题，修复后同样清理。
 - 保留测试源码、可复用测试工具和代码化夹具定义。用户的原始素材与已有业务档案不属于测试垃圾。
 - 临时产物使用明确的独立目录；删除前验证绝对路径和所有权，禁止跟随重解析点递归删除。
@@ -17,5 +17,6 @@
 ## 架构与交付
 
 - 通用领域和用例放 commonMain；文件、数据库、进程和平台 API 通过端口隔离；测试优先验证契约和故障边界。
-- 当前生产 UI 暂缓。UI/UX 先交付独立 HTML 原型，不照搬现有 Compose 实现，也不将模拟数据冒充真实执行结果。
+- 生产桌面 UI 已获用户授权：无侧栏压缩主页、拖入自动扫描、独立任务设置/日志书页窗口、顶部设置/历史/关于；遵循 Windows 11 Fluent 风格，真实状态只来自共享用例。
+- 开发/测试脚本集中放 sharedLogic/src/commonTest/resources/development-scripts 并忽略；生产代码和 Kotlin 测试源码仍正常跟踪。
 - 每阶段通过测试再推进；文档记录能力、已测范围和限制。中文 Git 提交，按已有授权正常推送，不强推。

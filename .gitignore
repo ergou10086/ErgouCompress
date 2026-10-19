@@ -49,3 +49,10 @@ hs_err_pid*
 *.tmp
 *.partial.*
 dist/
+
+# Local development scripts, acceptance scaffolds and design-only artifacts
+/sharedLogic/src/commonTest/resources/development-scripts/
+/tools/
+/verification/
+/validation/
+/design/

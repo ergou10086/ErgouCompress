@@ -10,6 +10,10 @@ kotlin {
     jvmToolchain(21)
 
     sourceSets {
+        commonTest {
+            // 本地开发脚本不属于运行时夹具，禁止复制历史验证目录到测试类路径。
+            resources.exclude("development-scripts/**")
+        }
         commonMain.dependencies {
             api(libs.kotlinx.coroutines.core)
             api(libs.kotlinx.serialization.json)
