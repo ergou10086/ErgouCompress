@@ -1,5 +1,6 @@
 package org.ergoutree.compress.presentation
 
+import kotlin.time.TimeSource
 import org.ergoutree.compress.application.*
 import org.ergoutree.compress.domain.*
 
@@ -40,7 +41,12 @@ data class WorkspaceRow(val media: ScannedMedia, val selected: Boolean, val stre
     } catch (e: Exception) { SizeEstimation.unknown(e.message ?: "先解决媒体策略冲突") }
 }
 /** 处理任务的实时状态与导入草稿分离，新增文件不会改动进行中的快照。 */
-data class TaskActivity(val id: String, val event: AttemptEvent? = null)
+data class TaskActivity(
+    val id: String,
+    val event: AttemptEvent? = null,
+    /** 单调计时用于当前文件耗时和剩余时间，不参与持久化。 */
+    val startedAt: TimeSource.Monotonic.ValueTimeMark? = null,
+)
 /** 多窗口共享单一状态源，界面只负责展示与发送意图。 */
 data class WorkspaceState(
     val initialized: Boolean = false, val startupBusy: Boolean = true, val tools: Toolchain? = null,
@@ -48,7 +54,10 @@ data class WorkspaceState(
     val draft: TaskDraft = TaskDraft(), val rows: List<WorkspaceRow> = emptyList(), val roots: List<String> = emptyList(),
     val scanning: Boolean = false, val preparing: Boolean = false, val toolBusy: Boolean = false, val estimating: Boolean = false,
     val scanComplete: Boolean = false, val scannedFiles: Long = 0, val scannedBytes: Long = 0, val scanningPath: String = "",
-    val jobs: List<JobRecord> = emptyList(), val active: TaskActivity? = null, val selectedJobId: String? = null,
+    val estimateDone: Int = 0, val estimateTotal: Int = 0,
+    val jobs: List<JobRecord> = emptyList(), val active: TaskActivity? = null,
+    val activeItems: List<ItemRecord> = emptyList(), val activeItemsJobId: String? = null,
+    val selectedJobId: String? = null,
     val detailItems: List<ItemRecord> = emptyList(), val commits: List<CommitRecord> = emptyList(),
     val detailAttempts: Map<String, List<AttemptRecord>> = emptyMap(), val detailsLoading: Boolean = false,
     val logLines: List<TaskLogLine> = emptyList(), val logJobId: String? = null,
@@ -61,4 +70,8 @@ data class WorkspaceState(
     val busy get() = intakeBusy || active != null || maintenanceBusy
     val selected get() = rows.filter { it.selected }
     val canStart get() = initialized && !intakeBusy && !maintenanceBusy && !closing && !restartRequired && scanComplete && tools != null && selected.isNotEmpty()
+    val pendingJobs get() = jobs.count { it.state == JobState.READY || it.state == JobState.PAUSED || it.state == JobState.PAUSE_REQUESTED }
+    val activeJob get() = jobs.firstOrNull { it.id == active?.id }
+    val currentJob get() = activeJob ?: jobs.firstOrNull { it.state == JobState.READY || it.state == JobState.PAUSED }
+    val activeCompleted get() = activeItems.count { it.state in setOf(ItemState.SUCCEEDED, ItemState.FAILED, ItemState.INTERRUPTED, ItemState.SKIPPED, ItemState.CANCELLED) }
 }

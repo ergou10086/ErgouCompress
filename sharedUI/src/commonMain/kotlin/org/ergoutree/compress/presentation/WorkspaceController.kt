@@ -2,9 +2,11 @@ package org.ergoutree.compress.presentation
 
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
+import kotlin.time.TimeSource
 import org.ergoutree.compress.application.*
 import org.ergoutree.compress.domain.*
 import org.ergoutree.compress.ports.*
+import org.ergoutree.compress.workspace.fileName
 
 /** 独立编排导入与持久队列，所有窗口消费同一状态，不在 Composable 中执行媒体 I/O。 */
 class WorkspaceController(val workflow: DesktopWorkspaceWorkflow, private val scope: CoroutineScope) {
@@ -100,7 +102,7 @@ class WorkspaceController(val workflow: DesktopWorkspaceWorkflow, private val sc
                     complete = complete && batchComplete
                     mutable.update { it.copy(scanComplete = complete) }
                 }
-                mutable.update { it.copy(message = if (complete && !intakeStop.requested) "扫描完成，审核文件后打开处理选项" else "扫描未完成，请重新扫描后开始任务") }
+                mutable.update { it.copy(message = if (complete && !intakeStop.requested) "扫描完成，已默认选中可处理项；可直接开始或先审核参数" else "扫描未完成，请重新扫描后再开始任务") }
             } catch (e: CancellationException) { throw e } catch (e: Exception) { mutable.update { it.copy(scanComplete = false) }; fail(e) }
             finally { mutable.update { it.copy(scanning = false) } }
         }
@@ -141,7 +143,8 @@ class WorkspaceController(val workflow: DesktopWorkspaceWorkflow, private val sc
                 workflow.queue.submit(job)
                 // 只有冻结并持久入队成功才清空当前草稿；正在处理的任务完全独立。
                 mutable.update { it.copy(rows = emptyList(), roots = pendingImports.flatten().distinct(), scannedFiles = 0, scannedBytes = 0,
-                    scanComplete = false, scanningPath = "", draft = it.draft.copy(acknowledgeInPlace = false), selectedJobId = job.id, message = "任务已入队，可以继续添加文件") }
+                    scanComplete = false, scanningPath = "", activeItems = emptyList(), draft = it.draft.copy(acknowledgeInPlace = false),
+                    selectedJobId = job.id, message = "任务已入队，可以继续添加文件") }
                 requestedJobs.addLast(job.id)
                 refreshHistory()
                 pump()
@@ -155,10 +158,29 @@ class WorkspaceController(val workflow: DesktopWorkspaceWorkflow, private val sc
             try {
                 while (requestedJobs.isNotEmpty() && !state.value.closing) {
                     val id = requestedJobs.removeFirst()
-                    mutable.update { it.copy(active = TaskActivity(id)) }
-                    try { workflow.queue.run(id) { event -> mutable.update { it.copy(active = TaskActivity(id, event)) } } }
-                    catch (e: CancellationException) { throw e } catch (e: Exception) { fail(e) }
+                    val started = TimeSource.Monotonic.markNow()
+                    val initialItems = runCatching { workflow.queue.items(id) }.getOrDefault(emptyList())
+                    mutable.update { it.copy(active = TaskActivity(id, startedAt = started), activeItems = initialItems, activeItemsJobId = id, message = "正在处理任务 ${id.take(8)}") }
+                    try {
+                        workflow.queue.run(id) { event ->
+                            mutable.update { s ->
+                                // 阶段事件即到达终态时先更新本地项状态，让批量计数无需等待下一次数据库刷新。
+                                val terminalState = when (event.stage) {
+                                    AttemptStage.SUCCEEDED -> ItemState.SUCCEEDED
+                                    AttemptStage.FAILED -> ItemState.FAILED
+                                    AttemptStage.INTERRUPTED -> ItemState.INTERRUPTED
+                                    AttemptStage.SKIPPED -> ItemState.SKIPPED
+                                    else -> null
+                                }
+                                val items = if (terminalState == null) s.activeItems else s.activeItems.map { item ->
+                                    if (item.plan.source.path == event.source) item.copy(state = terminalState) else item
+                                }
+                                s.copy(active = s.active?.copy(event = event) ?: TaskActivity(id, event, started), activeItems = items)
+                            }
+                        }
+                    } catch (e: CancellationException) { throw e } catch (e: Exception) { fail(e) }
                     refreshHistory()
+                    runCatching { workflow.queue.items(id) }.onSuccess { items -> mutable.update { it.copy(activeItems = items, activeItemsJobId = id) } }
                 }
             } catch (e: CancellationException) { throw e } catch (e: Exception) { fail(e) }
             finally { mutable.update { it.copy(active = null) } }
@@ -194,14 +216,20 @@ class WorkspaceController(val workflow: DesktopWorkspaceWorkflow, private val sc
     fun estimateSelected() {
         val snapshot = state.value
         if (snapshot.intakeBusy || snapshot.maintenanceBusy || snapshot.closing || snapshot.restartRequired || snapshot.selected.isEmpty() || snapshot.tools == null) return
-        mutable.update { it.copy(estimating = true, error = null) }; intakeStop = StopSignal()
+        val total = snapshot.selected.size
+        mutable.update { it.copy(estimating = true, estimateTotal = total, estimateDone = 0, error = null) }
+        intakeStop = StopSignal()
         launchOperation {
             try {
-                for (row in snapshot.selected) {
-                    if (intakeStop.requested) break
+                snapshot.selected.forEachIndexed { index, row ->
+                    if (intakeStop.requested) return@forEachIndexed
+                    mutable.update { it.copy(message = "正在采样估算 ${index + 1}/$total · ${fileName(row.media.file.path.value)}") }
                     val report = workflow.estimateSelection(PlanningSelection(row.media.file, requireNotNull(row.media.media)), snapshot.tools,
                         row.settings(snapshot.draft), AnalysisOptions(sample = true, staticHint = true), intakeStop)
-                    mutable.update { it.copy(rows = it.rows.map { current -> if (current.media.file.path == row.media.file.path) current.copy(sampled = report.estimate) else current }, message = report.estimate.explanation) }
+                    mutable.update {
+                        it.copy(rows = it.rows.map { current -> if (current.media.file.path == row.media.file.path) current.copy(sampled = report.estimate) else current },
+                            estimateDone = index + 1, message = report.estimate.explanation)
+                    }
                 }
             } catch (e: CancellationException) { throw e } catch (e: Exception) { fail(e) }
             finally { mutable.update { it.copy(estimating = false) }; drainImports() }

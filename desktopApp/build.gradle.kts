@@ -24,6 +24,8 @@ dependencies {
 compose.desktop {
     application {
         mainClass = "org.ergoutree.compress.project.MainKt"
+        // Compose 的 run 任务不是普通 JavaExec，开发数据根必须在这里显式传入。
+        jvmArgs += listOf("-Dergou.app.home=${rootDir.absolutePath}")
 
         nativeDistributions {
             targetFormats(TargetFormat.Exe)
